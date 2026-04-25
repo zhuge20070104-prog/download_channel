@@ -39,6 +39,7 @@ args = getResolvedOptions(sys.argv, [
     "DROPZONE_BUCKET",
     "BRONZE_BUCKET",
     "CHECKPOINT_TABLE",
+    "SNS_TOPIC_ARN",
     "ENVIRONMENT",
     # 可选: --BACKFILL_MODE, --TARGET_DT, --TARGET_STORE
 ])
@@ -52,16 +53,30 @@ job.init(args["JOB_NAME"], args)
 ENVIRONMENT = args["ENVIRONMENT"]
 DROPZONE_BUCKET = args["DROPZONE_BUCKET"]
 BRONZE_BUCKET = args["BRONZE_BUCKET"]
+SNS_TOPIC_ARN = args["SNS_TOPIC_ARN"]
 JOB_RUN_ID = args.get("JOB_RUN_ID", str(uuid.uuid4()))
 BACKFILL_MODE = args.get("BACKFILL_MODE", "false").lower() == "true"
 TARGET_DT = args.get("TARGET_DT", None)        # 手动指定日期
 TARGET_STORE = args.get("TARGET_STORE", None)   # 手动指定 store
 
 s3_client = boto3.client("s3")
+sns_client = boto3.client("sns")
 checkpoint = CheckpointManager(
     table_name=args["CHECKPOINT_TABLE"],
     aws_region=args.get("AWS_REGION", "us-east-1"),
 )
+
+
+def send_alert(subject: str, message: str):
+    """发送 SNS 告警。"""
+    try:
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject[:100],
+            Message=message,
+        )
+    except Exception as e:
+        print(f"[WARN] Failed to send SNS alert: {e}")
 
 
 def list_dropzone_partitions():
@@ -113,6 +128,13 @@ def process_partition(version: str, dt: str, store: str, keys: list):
     # ─── 2. 获取并发锁 ───
     if not checkpoint.acquire_lock(layer, dt, store, JOB_RUN_ID):
         print(f"[LOCKED] {version}/{dt}/{store} — skipping")
+        send_alert(
+            subject=f"[DC-ETL] Bronze LOCK SKIP: {dt}/{store}",
+            message=(
+                f"Bronze partition {version}/{dt}/{store} is locked by another job. "
+                f"Skipped. If this persists, check for stale locks in DynamoDB."
+            ),
+        )
         return
 
     print(f"[PROCESS] {version}/{dt}/{store} — {len(keys)} files")
@@ -164,6 +186,14 @@ def process_partition(version: str, dt: str, store: str, keys: list):
                 layer, dt, store, status="failed",
                 in_count=in_count, out_count=0, dlq_count=in_count,
                 input_files=keys, file_md5s=current_md5s, job_run_id=JOB_RUN_ID,
+            )
+            send_alert(
+                subject=f"[DC-ETL] Bronze DLQ: {dt}/{store}",
+                message=(
+                    f"Schema mismatch in {version}/{dt}/{store}.\n"
+                    f"{error_msg}\n"
+                    f"{in_count} rows sent to DLQ."
+                ),
             )
             return
 
@@ -229,6 +259,10 @@ def process_partition(version: str, dt: str, store: str, keys: list):
                 job_run_id=JOB_RUN_ID,
                 source_file=f"s3://{DROPZONE_BUCKET}/{key}",
             )
+        send_alert(
+            subject=f"[DC-ETL] Bronze Job ERROR: {dt}/{store}",
+            message=f"Bronze ETL failed for {version}/{dt}/{store}.\nError: {e}",
+        )
         checkpoint.release_lock(
             layer, dt, store, status="failed",
             in_count=0, out_count=0, dlq_count=1,
