@@ -2,8 +2,7 @@
 """
 Download Channel 宽表 (v2) Schema 定义
 
-Bronze 层 v2 保留原始宽表格式。
-Silver 层统一使用此 schema（窄表由 Silver Job pivot 成此格式）。
+Silver 层统一输出格式：Bronze 的 v1 窄表由 Silver Job pivot 成此 schema。
 Snowflake 的 SILVER.DC_WIDE 表也基于此 schema + _loaded_at 列。
 """
 

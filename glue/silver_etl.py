@@ -4,8 +4,8 @@ Glue Batch Job: Bronze S3 → Silver S3
 
 由 Glue Workflow 在 Bronze Job 成功后自动触发，也可手动运行。
 职责:
-  1. 读 Bronze Parquet（v1 窄表 + v2 宽表）
-  2. 窄表 → 宽表 pivot（统一 schema）
+  1. 读 Bronze v1 窄表 Parquet
+  2. Pivot 窄表 → v2 宽表（统一 Silver schema）
   3. DQ 卡点（§12）：不通过 → DLQ + 告警，不写 Silver
   4. 写 Silver S3（统一宽表 Parquet）
   5. 更新 checkpoint
@@ -22,13 +22,13 @@ from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from pyspark.sql.functions import (
-    col, current_timestamp, lit, sum as spark_sum,
+    col, current_timestamp, min as spark_min, sum as spark_sum, when as spark_when,
 )
 
 from lib.checkpoint import CheckpointManager
 from lib.dlq import write_dlq_dataframe, write_dlq_error_json
 from lib.dq_checks import DownloadChannelDQ
-from lib.schema_v2_wide import SILVER_OUTPUT_COLUMNS, WIDE_V2_PK
+from lib.schema_v2_wide import SILVER_OUTPUT_COLUMNS
 
 # ─── Glue Job 参数 ───
 # getResolvedOptions 只解析声明的参数，可选参数必须先用 sys.argv 探测再加进列表。
@@ -71,6 +71,8 @@ checkpoint = CheckpointManager(
     aws_region=args.get("AWS_REGION", "us-east-1"),
 )
 
+BRONZE_PREFIX = "download_channel/v1/"
+
 
 def send_alert(subject: str, message: str):
     """发送 SNS 告警。"""
@@ -85,47 +87,39 @@ def send_alert(subject: str, message: str):
 
 
 def list_bronze_partitions():
-    """扫描 Bronze 桶，返回需要处理的 (version, dt, store) 列表。"""
-    partitions = []
+    """扫描 Bronze v1 分区，返回需要处理的 (dt, store) 列表。"""
+    paginator = s3_client.get_paginator("list_objects_v2")
+    seen = set()
 
-    for version in ["v1", "v2"]:
-        prefix = f"download_channel/{version}/"
-        paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BRONZE_BUCKET, Prefix=BRONZE_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            parts = key.replace(BRONZE_PREFIX, "").split("/")
+            dt_part = next((p for p in parts if p.startswith("dt=")), None)
+            store_part = next((p for p in parts if p.startswith("store=")), None)
+            if not dt_part or not store_part:
+                continue
+            dt = dt_part.split("=")[1]
+            store = store_part.split("=")[1]
 
-        seen = set()
-        for page in paginator.paginate(Bucket=BRONZE_BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                parts = key.replace(prefix, "").split("/")
-                dt_part = next((p for p in parts if p.startswith("dt=")), None)
-                store_part = next((p for p in parts if p.startswith("store=")), None)
-                if not dt_part or not store_part:
-                    continue
-                dt = dt_part.split("=")[1]
-                store = store_part.split("=")[1]
+            if TARGET_DT and dt != TARGET_DT:
+                continue
+            if TARGET_STORE and store != TARGET_STORE:
+                continue
+            if (
+                not BACKFILL_MODE
+                and not TARGET_DT
+                and dt < LOOKBACK_CUTOFF_DT
+            ):
+                continue
 
-                if TARGET_DT and dt != TARGET_DT:
-                    continue
-                if TARGET_STORE and store != TARGET_STORE:
-                    continue
-                if (
-                    not BACKFILL_MODE
-                    and not TARGET_DT
-                    and dt < LOOKBACK_CUTOFF_DT
-                ):
-                    continue
+            seen.add((dt, store))
 
-                seen.add((version, dt, store))
-
-        partitions.extend(sorted(seen))
-
-    return partitions
+    return sorted(seen)
 
 
 def pivot_narrow_to_wide(narrow_df):
     """将窄表 (v1) pivot 成宽表 (v2) schema。"""
-    from pyspark.sql.functions import when as spark_when
-
     pivoted = narrow_df.groupBy("dt", "product_id", "app_store", "country", "device") \
         .agg(
             spark_sum("downloads").alias("downloads_total"),
@@ -153,6 +147,10 @@ def pivot_narrow_to_wide(narrow_df):
             spark_sum(spark_when(
                 col("channel") == "unpaid_organic", col("downloads")
             ).otherwise(0)).alias("downloads_unpaid_organic"),
+
+            # 4 个 channel 全 finalized 才算整行 finalized：MIN 在 boolean 上 False<True，
+            # 任一 channel 还在 preview 整行就是 False。NULL 行被 MIN 忽略。
+            spark_min("is_estimate_final").alias("is_estimate_final"),
         )
 
     # 计算 share 列
@@ -165,16 +163,12 @@ def pivot_narrow_to_wide(narrow_df):
         (col("downloads_featured") / col("downloads_total")).cast("decimal(6,4)")
     )
 
-    # is_estimate_final: 取窄表中该 group 的 ANY TRUE（如果有一个 channel finalized，
-    # 认为整个 (dt, app, country, device) 已 finalized）
-    # 简化处理：窄表 pivot 后暂设为 NULL，由下游 restate 机制覆盖
-    pivoted = pivoted.withColumn("is_estimate_final", lit(None).cast("boolean"))
     pivoted = pivoted.withColumn("ingest_ts", current_timestamp())
 
     return pivoted
 
 
-def process_partition(version: str, dt: str, store: str):
+def process_partition(dt: str, store: str):
     """处理一个 Bronze 分区 → Silver。"""
     layer = "silver"
     start_time = time.time()
@@ -182,7 +176,7 @@ def process_partition(version: str, dt: str, store: str):
     # ─── 1. 检查 Bronze checkpoint 确认这个分区已处理成功 ───
     bronze_ckpt = checkpoint.get_checkpoint("bronze", dt, store)
     if not bronze_ckpt or bronze_ckpt.get("status") != "succeeded":
-        print(f"[SKIP] silver/{version}/{dt}/{store} — Bronze not succeeded")
+        print(f"[SKIP] silver/{dt}/{store} — Bronze not succeeded")
         return
 
     # ─── 2. 获取 Silver 锁 ───
@@ -190,30 +184,24 @@ def process_partition(version: str, dt: str, store: str):
         print(f"[LOCKED] silver/{dt}/{store} — skipping")
         return
 
-    print(f"[PROCESS] silver/{version}/{dt}/{store}")
+    print(f"[PROCESS] silver/{dt}/{store}")
 
     try:
-        # ─── 3. 读 Bronze ───
-        bronze_path = (
-            f"s3://{BRONZE_BUCKET}/download_channel/{version}/"
-            f"dt={dt}/store={store}/"
-        )
+        # ─── 3. 读 Bronze 窄表 ───
+        bronze_path = f"s3://{BRONZE_BUCKET}/{BRONZE_PREFIX}dt={dt}/store={store}/"
         bronze_df = spark.read.parquet(bronze_path)
         in_count = bronze_df.count()
 
         if in_count == 0:
-            print(f"[EMPTY] silver/{version}/{dt}/{store} — 0 rows")
+            print(f"[EMPTY] silver/{dt}/{store} — 0 rows")
             checkpoint.release_lock(
                 layer, dt, store, status="succeeded",
                 in_count=0, out_count=0, job_run_id=JOB_RUN_ID,
             )
             return
 
-        # ─── 4. Pivot (v1) 或 透传 (v2) ───
-        if version == "v1":
-            wide_df = pivot_narrow_to_wide(bronze_df)
-        else:
-            wide_df = bronze_df
+        # ─── 4. Pivot 窄表 → 宽表 ───
+        wide_df = pivot_narrow_to_wide(bronze_df)
 
         # ─── 5. DQ 卡点 ───
         expected_count = bronze_ckpt.get("out_count")
@@ -302,11 +290,11 @@ def process_partition(version: str, dt: str, store: str):
 
         write_dlq_error_json(
             s3_client, BRONZE_BUCKET,
-            original_key=f"download_channel/{version}/dt={dt}/store={store}/",
+            original_key=f"{BRONZE_PREFIX}dt={dt}/store={store}/",
             error_type="SILVER_PROCESSING_ERROR",
             error_message=str(e),
             job_run_id=JOB_RUN_ID,
-            source_file=f"s3://{BRONZE_BUCKET}/download_channel/{version}/dt={dt}/store={store}/",
+            source_file=f"s3://{BRONZE_BUCKET}/{BRONZE_PREFIX}dt={dt}/store={store}/",
         )
         send_alert(
             subject=f"[DC-ETL] Silver Job ERROR: {dt}/{store}",
@@ -324,8 +312,8 @@ print(f"Silver ETL starting: env={ENVIRONMENT}")
 partitions = list_bronze_partitions()
 print(f"Found {len(partitions)} Bronze partitions to process")
 
-for version, dt, store in partitions:
-    process_partition(version, dt, store)
+for dt, store in partitions:
+    process_partition(dt, store)
 
 print("Silver ETL complete")
 job.commit()

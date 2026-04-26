@@ -1,6 +1,6 @@
-# Download Channel ETL — 五大运维机制详解
+# Download Channel ETL — 六大运维机制详解
 
-> 本文用大白话 + 生活类比 + 代码示意，解释 PLAN.md 里提到的五个关键运维机制。
+> 本文用大白话 + 生活类比 + 代码示意，解释 PLAN.md 里提到的六个关键运维机制。
 > 每一节都回答三个问题：**这是什么？为什么要有？怎么实现的？**
 
 ---
@@ -624,7 +624,121 @@ On-Demand 计费: $1.25 / 百万写 = 每天 < $0.001。
 
 ---
 
-## f) 整体架构理解（端到端追踪 + 组件分工澄清）
+## f) DLQ（死信区）的结构与重消费
+
+### 这是什么
+
+DLQ = Dead Letter Queue。Bronze/Silver Job 任何一种"这一批数据没法正常入库"的情况，都把**失败的数据**和**一份事故说明** (`.error.json`) 同时写到 DLQ S3 前缀。两个用途：
+
+1. **取证**：dropzone 的源文件可能受 TTL 影响过几个月就消失，DLQ 保下副本，事后能查
+2. **重消费**：修完问题后，把 DLQ 里的数据按一定流程塞回管道重跑
+
+### DLQ 的三类入口
+
+| 来源 | 触发条件 | error_type | 写法 |
+|---|---|---|---|
+| Bronze schema 校验 | 列名/类型对不上 | `SCHEMA_MISMATCH` | `copy_to_dlq`（拷源文件）+ `write_dlq_error_json`（写说明） |
+| Bronze/Silver 异常兜底 | try/except 接住的任何抛错 | `PROCESSING_ERROR` / `SILVER_PROCESSING_ERROR` | 仅 `write_dlq_error_json`（源文件还在原桶，不复制） |
+| Silver DQ 阻断 | §b 的 DQ Check 任一阻断项 | `DQ_BLOCK` | `write_dlq_dataframe`（把整批失败 DataFrame 写成 parquet） |
+
+### DLQ key 结构
+
+```
+s3://<dlq-bucket>/dead_letter/failed_at=<today>/<完整源路径>[.error.json]
+```
+
+举例：
+
+```
+源:    s3://dropzone/download_channel/narrow/dt=2025-12-15/store=ios/part-00000.parquet
+副本:  s3://dlq/dead_letter/failed_at=2026-04-27/download_channel/narrow/dt=2025-12-15/store=ios/part-00000.parquet
+说明:  s3://dlq/dead_letter/failed_at=2026-04-27/download_channel/narrow/dt=2025-12-15/store=ios/part-00000.parquet.error.json
+```
+
+### 为什么 key 要这样设计
+
+最初的实现是 `dead_letter/<today>/<filename>`，把源 key 剥到只剩文件名，会出两个硬伤：
+
+#### 问题 1: 分区信息全丢
+
+`dead_letter/2026-04-27/part-00000.parquet` 只能告诉你"今天 fail 的"，没法回答：是哪天（`dt=?`）的数据？哪个 store？而修复后的 key 自身就携带这些信息，list S3 直接 `--prefix .../dt=2025-12-15/` 即可锁定一批。
+
+#### 问题 2: 文件名碰撞 → 静默丢数据
+
+Spark 写出来的 part 文件名都长一个样（`part-00000-xxx.snappy.parquet`）。两个不同分区同一天 fail：
+
+```
+源 A: .../dt=2025-12-15/store=ios/part-00000.parquet
+源 B: .../dt=2025-12-15/store=google-play/part-00000.parquet
+```
+
+旧设计两条都拼成 `dead_letter/2026-04-27/part-00000.parquet`，**第二条 `copy_object` 直接把第一条覆盖**——第一份失败数据无声消失。修复后两条 key 各自带完整源路径，互不撞。
+
+#### 问题 3: failed_at 和 dt= 必须解耦
+
+`failed_at=` 是失败发生当天，`dt=` 是数据本身的业务日期。两者经常错开：
+
+- 日常 `failed_at ≈ dt + 1 天`
+- Backfill 重跑 2025-Q4 旧数据失败：`failed_at=2026-04-27`，`dt=2025-10-xx`
+- §c 的 Restate 修 7 天前的数据失败：`failed_at` 是今天，`dt` 是一周前
+
+把两个日期各自显式写在 key 里，比埋成单一字符串日期清晰得多。
+
+### error.json 的内容
+
+每份失败数据旁边都有一份说明。格式：
+
+```json
+{
+  "error_type": "SCHEMA_MISMATCH",
+  "error_message": "Missing columns: {'share_pct'}",
+  "timestamp": "2026-04-27T10:23:11.482312+00:00",
+  "job_run_id": "glue-jr-abc123",
+  "source_file": "s3://dropzone/download_channel/narrow/dt=2025-12-15/store=ios/part-00000.parquet",
+  "original_key": "download_channel/narrow/dt=2025-12-15/store=ios/part-00000.parquet",
+  "extra": null
+}
+```
+
+字段速查：
+
+| 字段 | 用处 |
+|---|---|
+| `error_type` | 枚举式分类（`SCHEMA_MISMATCH` / `PROCESSING_ERROR` / `SILVER_PROCESSING_ERROR` / `DQ_BLOCK`），便于批量过滤"先解决某一类" |
+| `error_message` | 人话说的具体原因（schema diff / 异常字符串等） |
+| `timestamp` + `job_run_id` | 出问题时去 CloudWatch 拉这次 Job Run 的完整 stack |
+| `source_file` / `original_key` | 溯源；DLQ key 已经携带这些信息，这里冗余记录便于程序化解析 |
+| `extra` | 可选 dict，调用方可塞额外上下文（schema diff、命中的 DQ 规则名、行数等），目前未使用 |
+
+### 重消费流程
+
+DLQ 不是"自动回放队列"。要把数据塞回管道有几条路，选哪条取决于失败原因：
+
+#### 路径 1: 上游本身就是坏数据 → 等上游 restate
+
+最常见。Data.ai 给错的数据，让上游下次 PUT 修正版到 dropzone 同路径。新文件 MD5 不同 → §c 的 MD5 比对自动触发覆盖处理。**完全不需要碰 DLQ**，DLQ 只是事后查证的留底。
+
+#### 路径 2: 我们的代码有 bug → 修代码 + BACKFILL_MODE 重跑
+
+修完 bug 后，**dropzone 文件没动、MD5 没变**——日常路径会被 §c 的 MD5 比对跳过。要强制重跑，启动 Bronze Job 时带：
+
+```
+BACKFILL_MODE=true TARGET_DT=2025-12-15 TARGET_STORE=ios
+```
+
+[bronze_etl.py](glue/bronze_etl.py) 里 `BACKFILL_MODE=true` 就是用来**绕过 MD5 比对、强制重处理**指定分区的开关。
+
+#### 路径 3: 数据被 dropzone TTL 删了 → 从 DLQ 拷回
+
+如果原数据已被 dropzone 生命周期策略删掉（例如几个月前的），从 DLQ 拷回：strip 掉 `dead_letter/failed_at=YYYY-MM-DD/` 前缀，剩下的就是要恢复到 dropzone 的相对路径，然后走路径 2。
+
+### 和 §c restate 的关系
+
+路径 1 走的就是 §c 的 restate 路径（MD5 不同 → 覆盖处理）。路径 2、3 用 `BACKFILL_MODE` 显式绕过 MD5 检查。三条路最后都汇到同一套 Bronze→Silver 写入逻辑，DLQ 不引入额外 ETL 入口。
+
+---
+
+## g) 整体架构理解（端到端追踪 + 组件分工澄清）
 
 > 这一节不是新机制，而是把 §a-§e 串起来回答几个高频疑问：整条链路是怎么触发的？DynamoDB 到底干了哪些活？Bronze 和 Silver 是什么关系？restate 数据怎么一行一行流过整个链路的？
 

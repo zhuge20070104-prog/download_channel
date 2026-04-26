@@ -31,12 +31,14 @@ def write_dlq_error_json(
     """
     写一个 .error.json 到 DLQ 前缀。
 
+    Key 结构: dead_letter/failed_at=<today>/<original_key>.error.json
+    保留完整源路径（含 dt=/store= 分区），避免不同分区同名 part 文件互相覆盖；
+    failed_at 单独标注失败发生当天，与数据本身的业务日期 (dt=) 解耦。
+
     返回 DLQ 中 error.json 的 S3 key。
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # 取 original_key 的文件名部分
-    file_name = original_key.rstrip("/").split("/")[-1]
-    error_key = f"dead_letter/{today}/{file_name}.error.json"
+    error_key = f"dead_letter/failed_at={today}/{original_key.rstrip('/')}.error.json"
 
     error_doc = {
         "error_type": error_type,
@@ -68,11 +70,13 @@ def copy_to_dlq(
     """
     将原文件拷贝到 DLQ 前缀。
 
+    Key 结构: dead_letter/failed_at=<today>/<source_key>
+    保留完整源路径（含 dt=/store= 分区），便于按数据日期筛选重消费、且避免 part 文件名碰撞。
+
     返回 DLQ 中文件副本的 S3 key。
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    file_name = source_key.rstrip("/").split("/")[-1]
-    dlq_key = f"dead_letter/{today}/{file_name}"
+    dlq_key = f"dead_letter/failed_at={today}/{source_key}"
 
     s3_client.copy_object(
         Bucket=dlq_bucket,
