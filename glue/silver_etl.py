@@ -14,6 +14,7 @@ Glue Batch Job: Bronze S3 → Silver S3
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from awsglue.context import GlueContext
@@ -30,14 +31,18 @@ from lib.dq_checks import DownloadChannelDQ
 from lib.schema_v2_wide import SILVER_OUTPUT_COLUMNS, WIDE_V2_PK
 
 # ─── Glue Job 参数 ───
-args = getResolvedOptions(sys.argv, [
+# getResolvedOptions 只解析声明的参数，可选参数必须先用 sys.argv 探测再加进列表。
+REQUIRED_ARGS = [
     "JOB_NAME",
     "BRONZE_BUCKET",
     "SILVER_BUCKET",
     "CHECKPOINT_TABLE",
     "SNS_TOPIC_ARN",
     "ENVIRONMENT",
-])
+]
+OPTIONAL_ARGS = ["BACKFILL_MODE", "TARGET_DT", "TARGET_STORE", "LOOKBACK_DAYS"]
+present_optional = [a for a in OPTIONAL_ARGS if f"--{a}" in sys.argv]
+args = getResolvedOptions(sys.argv, REQUIRED_ARGS + present_optional)
 
 sc = SparkContext()
 glue_context = GlueContext(sc)
@@ -50,8 +55,14 @@ BRONZE_BUCKET = args["BRONZE_BUCKET"]
 SILVER_BUCKET = args["SILVER_BUCKET"]
 SNS_TOPIC_ARN = args["SNS_TOPIC_ARN"]
 JOB_RUN_ID = args.get("JOB_RUN_ID", str(uuid.uuid4()))
+BACKFILL_MODE = args.get("BACKFILL_MODE", "false").lower() == "true"
 TARGET_DT = args.get("TARGET_DT", None)
 TARGET_STORE = args.get("TARGET_STORE", None)
+LOOKBACK_DAYS = int(args.get("LOOKBACK_DAYS", "14"))
+
+LOOKBACK_CUTOFF_DT = (
+    datetime.now(timezone.utc).date() - timedelta(days=LOOKBACK_DAYS)
+).isoformat()
 
 s3_client = boto3.client("s3")
 sns_client = boto3.client("sns")
@@ -96,6 +107,12 @@ def list_bronze_partitions():
                 if TARGET_DT and dt != TARGET_DT:
                     continue
                 if TARGET_STORE and store != TARGET_STORE:
+                    continue
+                if (
+                    not BACKFILL_MODE
+                    and not TARGET_DT
+                    and dt < LOOKBACK_CUTOFF_DT
+                ):
                     continue
 
                 seen.add((version, dt, store))

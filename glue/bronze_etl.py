@@ -16,7 +16,7 @@ Glue Batch Job: Dropzone → Bronze S3
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from awsglue.context import GlueContext
@@ -34,15 +34,18 @@ from lib.schema_v1_narrow import NARROW_V1_PK, NARROW_V1_SCHEMA, VALID_CHANNELS
 from lib.schema_v2_wide import WIDE_V2_PK, WIDE_V2_SCHEMA
 
 # ─── Glue Job 参数 ───
-args = getResolvedOptions(sys.argv, [
+# getResolvedOptions 只解析声明的参数，可选参数必须先用 sys.argv 探测再加进列表。
+REQUIRED_ARGS = [
     "JOB_NAME",
     "DROPZONE_BUCKET",
     "BRONZE_BUCKET",
     "CHECKPOINT_TABLE",
     "SNS_TOPIC_ARN",
     "ENVIRONMENT",
-    # 可选: --BACKFILL_MODE, --TARGET_DT, --TARGET_STORE
-])
+]
+OPTIONAL_ARGS = ["BACKFILL_MODE", "TARGET_DT", "TARGET_STORE", "LOOKBACK_DAYS"]
+present_optional = [a for a in OPTIONAL_ARGS if f"--{a}" in sys.argv]
+args = getResolvedOptions(sys.argv, REQUIRED_ARGS + present_optional)
 
 sc = SparkContext()
 glue_context = GlueContext(sc)
@@ -58,6 +61,12 @@ JOB_RUN_ID = args.get("JOB_RUN_ID", str(uuid.uuid4()))
 BACKFILL_MODE = args.get("BACKFILL_MODE", "false").lower() == "true"
 TARGET_DT = args.get("TARGET_DT", None)        # 手动指定日期
 TARGET_STORE = args.get("TARGET_STORE", None)   # 手动指定 store
+LOOKBACK_DAYS = int(args.get("LOOKBACK_DAYS", "14"))  # 日常 ETL 只扫近 N 天，避开历史 partition 全扫
+
+# 日常路径用 cutoff 限制扫描范围；BACKFILL_MODE 或 TARGET_DT 显式指定时绕过
+LOOKBACK_CUTOFF_DT = (
+    datetime.now(timezone.utc).date() - timedelta(days=LOOKBACK_DAYS)
+).isoformat()
 
 s3_client = boto3.client("s3")
 sns_client = boto3.client("sns")
@@ -103,6 +112,14 @@ def list_dropzone_partitions():
                 if TARGET_DT and dt != TARGET_DT:
                     continue
                 if TARGET_STORE and store != TARGET_STORE:
+                    continue
+                # 日常路径：只扫近 LOOKBACK_DAYS 天的分区。
+                # backfill 或显式指定日期时绕过此限制。
+                if (
+                    not BACKFILL_MODE
+                    and not TARGET_DT
+                    and dt < LOOKBACK_CUTOFF_DT
+                ):
                     continue
 
                 seen.setdefault((dt, store), []).append(key)
