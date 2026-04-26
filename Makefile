@@ -69,8 +69,13 @@ deploy-infra-phase1: ## Phase 1: TF apply (infra + Snowflake, no triggers)
 		-target=module.snowflake
 
 .PHONY: apply-snowflake-sql
-apply-snowflake-sql: ## Phase 2: Run Snowflake SQL (01-06)
-	bash scripts/apply_snowflake_sql.sh "$(ENV)" "$(AWS_ACCOUNT_ID)"
+apply-snowflake-sql: ## Phase 2: Run Snowflake SQL (01-08)
+	@ALERT_EMAIL_VAL=$$(grep -E '^\s*alarm_email\s*=' $(TF_DIR)/environments/$(ENV).tfvars | sed -E 's/.*=\s*"([^"]+)".*/\1/'); \
+	if [ -z "$$ALERT_EMAIL_VAL" ]; then \
+		echo "ERROR: alarm_email not found in $(TF_DIR)/environments/$(ENV).tfvars"; exit 1; \
+	fi; \
+	echo "Using alert email: $$ALERT_EMAIL_VAL"; \
+	bash scripts/apply_snowflake_sql.sh "$(ENV)" "$(AWS_ACCOUNT_ID)" "$$ALERT_EMAIL_VAL"
 
 .PHONY: deploy-infra-phase2
 deploy-infra-phase2: ## Phase 3: Full TF apply (triggers enabled)
