@@ -82,8 +82,10 @@ download_channel/
 │   ├── dlq_replay.py
 │   └── lib/                       # Shared libraries
 ├── lambda/
-│   └── dlq_weekly_report/         # Weekly DLQ summary Lambda
-├── snowflake_sql/                 # Snowflake DDL (01-06)
+│   ├── dlq_weekly_report/         # Weekly DLQ summary
+│   ├── stale_lock_check/          # DynamoDB stale lock detector (every 30m)
+│   └── dropzone_freshness_check/  # Daily upstream-data-missing detector
+├── snowflake_sql/                 # Snowflake DDL (01-08)
 ├── athena_ddl/                    # Athena external table DDL
 ├── scripts/                       # Deploy helper scripts
 ├── Makefile                       # All operations
@@ -118,7 +120,7 @@ The deploy is split into 6 phases because of a **bidirectional IAM trust** betwe
 | 1/6 | `make check-tools check-aws check-snowflake` | Validate prerequisites |
 | 2/6 | `make upload-glue-scripts` | Package `glue/lib/` → `lib.zip`, upload to S3 |
 | 3/6 | `make deploy-infra-phase1` | Terraform apply (storage, DynamoDB, Snowflake DB/Integration) — gets `STORAGE_AWS_IAM_USER_ARN` |
-| 4/6 | `make apply-snowflake-sql` | snowsql runs 01-06: tables, pipe, dynamic tables, dedup task |
+| 4/6 | `make apply-snowflake-sql` | snowsql runs 01-08: tables, pipe, dynamic tables, dedup task, freshness alerts |
 | 5/6 | `make deploy-infra-phase2` | Full Terraform apply — creates IAM trust with Snowflake ARN, enables triggers |
 | 6/6 | `make run-etl ENV=dev` | Verify end-to-end |
 
@@ -137,7 +139,7 @@ The deploy is split into 6 phases because of a **bidirectional IAM trust** betwe
 | `snowflake` | DB, schemas, warehouse, roles, integration | Snowflake foundation |
 | `snowpipe` | IAM role, SQS queue, SNS subscription | S3 → Snowflake bridge |
 | `gold_dynamic_tables` | Grants | Permissions for Dynamic Tables |
-| `observability` | Alarms, SNS, Lambda, Dashboard | Monitoring + DLQ weekly report |
+| `observability` | SNS, CW Alarms, 3 Lambdas, Dashboard | Glue failure alarms + DLQ report + stale-lock + dropzone freshness |
 
 ## S3 Layout
 
@@ -188,6 +190,30 @@ Silver ETL runs 5 DQ checks before writing:
 | Equation: total = featured + organic | > 0.1% | WARN |
 
 Blocking failures route data to DLQ + send SNS alert. Warnings proceed with SNS alert.
+
+## Monitoring & Alerts
+
+All alerts publish to a single SNS topic (`iodp-dc-alerts-<env>`) subscribed to `alarm_email` from tfvars. Snowflake-side alerts use a separate Email Notification Integration.
+
+| # | Alert | Trigger | Implementation |
+|---|-------|---------|---------------|
+| 1 | Glue Job failure | `numFailedTasks ≥ 1` | CloudWatch Alarm per Glue job → SNS |
+| 2 | DLQ new files | `dlq_count > 0` after a Glue run | Inline `send_alert()` in `bronze_etl.py` / `silver_etl.py` |
+| 3 | DLQ weekly report | Mondays 09:00 UTC | `lambda/dlq_weekly_report/` via EventBridge cron |
+| 4 | Snowpipe silent ≥ 2h | `COPY_HISTORY` empty for `PIPE_DC_WIDE` | Snowflake `ALERT IODP_DC_SNOWPIPE_FRESHNESS_<ENV>` (hourly) |
+| 5 | Stale DynamoDB lock | `status=running AND lock_expires_at < now` | `lambda/stale_lock_check/` every 30 min |
+| 6 | Upstream data missing | No files under expected `dt=today` partitions | `lambda/dropzone_freshness_check/` daily 11:00 UTC (1h after ETL) |
+| 7 | DQ check failure | Any blocking DQ check fails | Inline `send_alert()` in `silver_etl.py` |
+
+Bonus: `IODP_DC_DYNAMIC_TABLE_LAG_<ENV>` Snowflake Alert flags failed Gold Dynamic Table refreshes.
+
+**⚠ Snowflake email setup** — `SYSTEM$SEND_EMAIL` only delivers to addresses **verified on a Snowflake user profile in this account**. Before deploying, log into Snowflake → Account → Users & Roles → set & verify the email on the user that receives the alert. Otherwise alerts #4 (and the Dynamic-Table bonus) will silently fail at runtime even though Terraform / `apply-snowflake-sql` succeed.
+
+**Tunable schedules** (in `terraform/modules/observability/variables.tf`):
+- `stale_lock_check_schedule` (default `rate(30 minutes)`)
+- `dropzone_freshness_schedule` (default `cron(0 11 * * ? *)`)
+- `expected_dropzone_versions` (default `["wide"]` — add `"narrow"` if v1 still active)
+- `expected_dropzone_stores` (default `["ios", "google-play"]`)
 
 ## DLQ & Replay
 
@@ -246,6 +272,17 @@ DROP DATABASE IODP_DC_DEV;
 **Checkpoint lock stuck:**
 - Query DynamoDB: `aws dynamodb get-item --table-name iodp-dc-checkpoint-<env> --key '{"partition_key":{"S":"bronze#2026-04-25#ios"}}'`
 - If `lock_expires_at` is in the past, the lock will auto-release on next run
+- The `stale_lock_check` Lambda (every 30 min) emits an SNS alert listing every partition in this state — check inbox before manually clearing
+
+**Snowflake alert never fires:**
+- `SYSTEM$SEND_EMAIL` requires the recipient address to be verified on a Snowflake user — see Monitoring & Alerts section
+- Verify alert is enabled: `SHOW ALERTS LIKE 'IODP_DC_%';` (column `state` should be `started`)
+- Inspect history: `SELECT * FROM TABLE(INFORMATION_SCHEMA.ALERT_HISTORY()) ORDER BY SCHEDULED_TIME DESC LIMIT 10;`
+- Note: `ACCOUNT_USAGE.COPY_HISTORY` has ~45 min latency, so alert window is set to 2h to avoid false positives
+
+**Dropzone freshness Lambda false-positives:**
+- If Data.ai routinely uploads after 11:00 UTC, push the schedule later via `dropzone_freshness_schedule` tfvar
+- Or set `CHECK_DATE_OFFSET_DAYS=-1` env var on the Lambda to verify yesterday's data instead of today's
 
 **Glue job timeout:**
 - Increase `glue_timeout_minutes` in tfvars
