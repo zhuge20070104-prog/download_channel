@@ -98,8 +98,9 @@ def handler(event, context):
 
         lines.append("")
         lines.append(
-            "Action: Review errors and run `make dlq-replay DATE=<date>` "
-            "after fixing the root cause."
+            "Action: Review errors, fix root cause, then run "
+            "`make dlq-replay DATE=<failed_at-day>` "
+            "(DATE = the UTC day the failure happened, i.e. the failed_at=<DATE> prefix)."
         )
         body = "\n".join(lines)
 

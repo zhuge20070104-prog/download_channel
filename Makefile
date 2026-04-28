@@ -141,13 +141,16 @@ dlq-review: ## List DLQ files
 	aws s3 ls "s3://iodp-dc-bronze-$(ENV)-$(AWS_ACCOUNT_ID)/dead_letter/" --recursive --human-readable
 
 .PHONY: dlq-replay
-dlq-replay: ## Replay DLQ for a specific date: make dlq-replay DATE=2026-04-25
-	@test -n "$(DATE)" || { echo "ERROR: DATE required"; exit 1; }
+dlq-replay: ## Replay all DLQ files from a given failure day: make dlq-replay DATE=2026-04-25
+	## DATE = the day the failure happened (UTC), i.e. the failed_at=<DATE>
+	## prefix in s3://<bronze>/dead_letter/. NOT the business dt of the data —
+	## one failure day usually contains failures spanning multiple business dt's.
+	@test -n "$(DATE)" || { echo "ERROR: DATE (failed_at day, YYYY-MM-DD) required"; exit 1; }
 	aws glue start-job-run \
 		--job-name "iodp-dc-dlq-replay-$(ENV)" \
-		--arguments "{\"--REPLAY_DATE\":\"$(DATE)\"}" \
+		--arguments "{\"--FAILED_AT_DATE\":\"$(DATE)\"}" \
 		--region $(AWS_REGION)
-	@echo "DLQ replay job started for $(DATE)"
+	@echo "DLQ replay job started for failed_at=$(DATE)"
 
 # ════════════════════════════════════════════════════════════════
 #  Status & Info

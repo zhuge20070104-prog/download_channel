@@ -101,11 +101,15 @@ def write_dlq_dataframe(
     将 DQ 失败的 DataFrame 写入 DLQ 为 Parquet。
 
     用于 Silver DQ 卡点失败时，把整个分区的问题数据存下来。
+
+    Path 结构: dead_letter/failed_at=<today>/dq_failure_dt=<业务dt>/
+    与 copy_to_dlq / write_dlq_error_json 的 failed_at= 一级分区保持一致，
+    便于 dlq_replay 一次扫一个失败日。
     返回 DLQ 路径。
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     dlq_path = (
-        f"s3://{dlq_bucket}/dead_letter/{today}/"
+        f"s3://{dlq_bucket}/dead_letter/failed_at={today}/"
         f"dq_failure_dt={partition_dt}/"
     )
 

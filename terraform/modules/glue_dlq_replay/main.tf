@@ -27,7 +27,7 @@ resource "aws_glue_job" "dlq_replay" {
     "--BRONZE_BUCKET"                      = var.bronze_bucket_name
     "--DROPZONE_BUCKET"                    = var.dropzone_bucket_name
     "--ENVIRONMENT"                        = var.environment
-    "--REPLAY_DATE"                        = "PLACEHOLDER"
+    "--FAILED_AT_DATE"                     = "PLACEHOLDER"
   }
 
   tags = var.tags
