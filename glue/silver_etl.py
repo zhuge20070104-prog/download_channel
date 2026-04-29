@@ -22,7 +22,8 @@ from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from pyspark.sql.functions import (
-    col, current_timestamp, min as spark_min, sum as spark_sum, when as spark_when,
+    coalesce, col, current_timestamp, lit,
+    min as spark_min, sum as spark_sum, when as spark_when,
 )
 
 from lib.checkpoint import CheckpointManager
@@ -148,9 +149,10 @@ def pivot_narrow_to_wide(narrow_df):
                 col("channel") == "unpaid_organic", col("downloads")
             ).otherwise(0)).alias("downloads_unpaid_organic"),
 
-            # 4 个 channel 全 finalized 才算整行 finalized：MIN 在 boolean 上 False<True，
-            # 任一 channel 还在 preview 整行就是 False。NULL 行被 MIN 忽略。
-            spark_min("is_estimate_final").alias("is_estimate_final"),
+            # 4 个 channel 全 True 才算整行 finalized：MIN 在 boolean 上 False<True。
+            # coalesce(.., False) 把 NULL 视作 False：避免一个 group 全 NULL 时 MIN
+            # 返回 NULL，下游 WHERE is_estimate_final = TRUE 会漏掉这种行。
+            spark_min(coalesce(col("is_estimate_final"), lit(False))).alias("is_estimate_final"),
         )
 
     # 计算 share 列

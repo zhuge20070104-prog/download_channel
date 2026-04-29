@@ -162,11 +162,25 @@ def process_partition(dt: str, store: str, keys: list):
             return
 
         # ─── 4. Schema 校验 + 类型转换 ───
-        expected_cols = {f.name for f in NARROW_V1_SCHEMA.fields if f.name != "ingest_ts"}
-        actual_cols = set(raw_df.columns)
-        missing_cols = expected_cols - actual_cols
-        if missing_cols:
-            error_msg = f"Missing columns: {missing_cols}"
+        # 同时校验列名和列类型：上游若把 boolean 列偷偷改成 string，name-only 检查
+        # 会过，但 .cast() 会把 "" 静默转成 NULL，问题被推迟到下游 Athena 才爆。
+        expected_fields = {
+            f.name: f.dataType for f in NARROW_V1_SCHEMA.fields if f.name != "ingest_ts"
+        }
+        actual_fields = {f.name: f.dataType for f in raw_df.schema.fields}
+        missing_cols = sorted(set(expected_fields) - set(actual_fields))
+        type_mismatches = sorted(
+            f"{name}: got {actual_fields[name]}, want {expected_fields[name]}"
+            for name in expected_fields
+            if name in actual_fields and actual_fields[name] != expected_fields[name]
+        )
+        if missing_cols or type_mismatches:
+            error_parts = []
+            if missing_cols:
+                error_parts.append(f"missing={missing_cols}")
+            if type_mismatches:
+                error_parts.append(f"type_mismatch=[{'; '.join(type_mismatches)}]")
+            error_msg = "; ".join(error_parts)
             print(f"[DLQ] {dt}/{store} — {error_msg}")
             for key in keys:
                 copy_to_dlq(s3_client, DROPZONE_BUCKET, key, BRONZE_BUCKET)
