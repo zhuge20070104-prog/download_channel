@@ -34,6 +34,11 @@ variable "checkpoint_table_arn" {
   type = string
 }
 
+variable "checkpoint_status_index_arn" {
+  description = "ARN of the sparse status-index GSI (Lambda Query target)"
+  type        = string
+}
+
 variable "dropzone_bucket_name" {
   type = string
 }

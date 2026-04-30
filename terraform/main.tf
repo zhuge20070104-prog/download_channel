@@ -83,15 +83,16 @@ module "observability" {
     "iodp-dc-bronze-etl-${var.environment}",
     "iodp-dc-silver-etl-${var.environment}",
   ]
-  bronze_bucket_name    = module.storage.bronze_bucket_name
-  bronze_bucket_arn     = module.storage.bronze_bucket_arn
-  checkpoint_table_name = module.dynamodb.checkpoint_table_name
-  checkpoint_table_arn  = module.dynamodb.checkpoint_table_arn
-  dropzone_bucket_name  = var.dropzone_bucket_name
-  dropzone_bucket_arn   = "arn:aws:s3:::${var.dropzone_bucket_name}"
-  alarm_email           = var.alarm_email
-  triggers_enabled      = var.triggers_enabled
-  tags                  = local.mandatory_tags
+  bronze_bucket_name          = module.storage.bronze_bucket_name
+  bronze_bucket_arn           = module.storage.bronze_bucket_arn
+  checkpoint_table_name       = module.dynamodb.checkpoint_table_name
+  checkpoint_table_arn        = module.dynamodb.checkpoint_table_arn
+  checkpoint_status_index_arn = module.dynamodb.checkpoint_status_index_arn
+  dropzone_bucket_name        = var.dropzone_bucket_name
+  dropzone_bucket_arn         = "arn:aws:s3:::${var.dropzone_bucket_name}"
+  alarm_email                 = var.alarm_email
+  triggers_enabled            = var.triggers_enabled
+  tags                        = local.mandatory_tags
 }
 
 # ════════════════════════════════════════════════════════════════

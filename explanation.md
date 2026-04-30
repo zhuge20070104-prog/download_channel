@@ -904,6 +904,648 @@ silver#2026-04-25#ios   ← Silver Job 自己的状态
 
 ---
 
+## h) 锁超时 Lambda 的实现细节：DynamoDB Scan 与分页
+
+> 这一节展开 [lambda/stale_lock_check/handler.py](lambda/stale_lock_check/handler.py) 里两处容易踩坑的实现细节：(1) 用 `Scan` + `FilterExpression` 找 stale 锁的成本结构；(2) `LastEvaluatedKey` 分页机制。
+
+### 1. `Scan` + `FilterExpression` 的成本结构
+
+代码片段：
+
+```python
+scan_kwargs = {
+    "FilterExpression": "#s = :running AND lock_expires_at < :now",
+    ...
+}
+while True:
+    resp = table.scan(**scan_kwargs)
+    stale.extend(resp.get("Items", []))
+    if "LastEvaluatedKey" not in resp:
+        break
+    scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+```
+
+三个关键事实让这种用法在表变大后会变贵、变慢：
+
+1. **`Scan` 是真·全表扫描**：从第一条 item 顺序读到最后一条，每个 item 都从存储里加载到服务端
+2. **`FilterExpression` 是"读完再过滤"**：服务端读出全部 item 之后才丢弃不匹配的；**不匹配的 item 也按 RCU 计费**
+3. **计费基准是 `ScannedCount`（扫描量），不是 `Count`（返回量）**：哪怕过滤后 0 行返回，你也付了"全表的钱"
+
+#### 当前规模实测推算
+
+| 维度 | 数值 |
+|---|---|
+| partition_key 形态 | `bronze#2026-04-25#ios` / `silver#2026-04-25#ios` 等 |
+| 每天新增行数 | ~4 行（bronze/silver × ios/android） |
+| 一年 | ~1460 行 |
+| 三年 | ~4400 行 |
+| 单 item 大小 | ~500 字节 |
+| 三年整表 | ~2 MB |
+| 单次 Scan RCU | ~250（On-Demand） |
+| 单次 Scan 费用 | ~$0.0000625 |
+| 每 30 分钟扫一次的月费 | ~$3 |
+
+**结论**：当前规模成本不疼。但分区数会**线性增长**（除非 TTL 清理），三年后单次扫描会从 1 次 API 调用变成多次分页。
+
+#### 教科书优化：稀疏 GSI（Global Secondary Index）
+
+DynamoDB GSI 的关键性质：**只索引"含有该字段"的 item**。如果代码在 Job 成功后**删除** `status` 字段（而不是写 `status='succeeded'`），GSI 里就只剩"当下在跑"的几行：
+
+```
+主表（4400 items）:
+  bronze#2024-12-01#ios   (无 status 字段)                              ← 不进 GSI
+  bronze#2024-12-01#and   (无 status 字段)                              ← 不进 GSI
+  ...
+  bronze#2026-04-26#ios   status=running, lock_expires_at=2026-04-26T12:00Z   ← 进 GSI
+  silver#2026-04-26#ios   status=running, lock_expires_at=2026-04-26T12:00Z   ← 进 GSI
+
+status-GSI（通常 0-4 行）:
+  bronze#2026-04-26#ios   status=running   ...
+  silver#2026-04-26#ios   status=running   ...
+```
+
+Lambda 改成：
+
+```python
+table.query(
+    IndexName='status-index',
+    KeyConditionExpression='#s = :running',
+    FilterExpression='lock_expires_at < :now',
+    ExpressionAttributeNames={'#s': 'status'},
+    ExpressionAttributeValues={':running': 'running', ':now': now_iso},
+)
+```
+
+无论主表多大，扫描量恒等于"当前 running 的分区数"（通常 0-4 个）。
+
+**当前不必动**——成本和延迟都还在可接受范围；如果将来分区数过万再加 GSI。
+
+### 2. `LastEvaluatedKey` 分页机制
+
+#### 为什么需要分页
+
+DynamoDB `Scan` / `Query` 有**硬限制**：单次响应最多返回 1 MB 数据（不可调）。这是平台限制，防止单次调用占用过多后端资源、阻塞太久、撑爆客户端内存。
+
+如果表大于 1 MB，**单次 scan 拿不全**——必须分多次调用拼起来。
+
+#### `LastEvaluatedKey` 是什么
+
+把它想成"读书读到哪儿了的书签"：
+
+- DynamoDB 扫到 1 MB 上限时停下，**记下当前扫到哪个 item**
+- 把这个位置（其实就是该 item 的主键）打包成一个不透明 dict 放在响应里，字段名叫 `LastEvaluatedKey`
+- 客户端下一次 scan 把它当作 `ExclusiveStartKey` 传回去，意思是"**从这个 item 之后**继续扫"（exclusive = 不含这个 item 自己）
+- 扫到表尾时，响应里**不会有 `LastEvaluatedKey` 字段** → 客户端知道扫完了
+
+#### 一个具体例子
+
+假设 checkpoint 表有 10000 个 item、~500 字节/个、共 ~5 MB（虚构场景，便于看清分页）：
+
+```
+第 1 次 table.scan(FilterExpression=...):
+  服务端扫 partition_key='bronze#2024-01-01#ios' .. 'bronze#2024-12-31#and'（~2000 个，~1 MB）
+  Filter 应用: status='running' AND lock_expires_at < now → 这一段全是历史完成的，0 个匹配
+  响应:
+    Items:            []                                     ← 过滤后 0 个
+    Count:            0                                       ← 返回数
+    ScannedCount:     2000                                    ← 实际扫了 2000 个（计费基准！）
+    LastEvaluatedKey: {"partition_key": "bronze#2024-12-31#and"}   ← 还没扫完的书签
+
+第 2 次 table.scan(ExclusiveStartKey={'partition_key': 'bronze#2024-12-31#and'}, ...):
+  从书签之后开始扫又一段 ~1 MB
+  响应:
+    Items:            [{"partition_key": "bronze#2025-06-15#ios", ...}]  ← 命中 1 个 stale
+    LastEvaluatedKey: {"partition_key": "bronze#2025-06-30#and"}
+
+... 重复第 3、第 4 次 ...
+
+第 5 次 table.scan(ExclusiveStartKey=...):
+  这次扫到表尾
+  响应:
+    Items:            []
+    ScannedCount:     2000
+    (没有 LastEvaluatedKey 字段！)
+
+  代码里:
+    if "LastEvaluatedKey" not in resp:
+        break       # ← 这里跳出 while True
+
+最终 stale 列表 = 5 次响应的 Items 全拼起来
+```
+
+#### 代码逐行映射
+
+```python
+stale = []
+scan_kwargs = {"FilterExpression": ..., ...}
+
+while True:
+    resp = table.scan(**scan_kwargs)              # 单次最多读 1 MB
+    stale.extend(resp.get("Items", []))           # 累加这一页的过滤结果
+    if "LastEvaluatedKey" not in resp:            # 没有书签 = 已扫到表尾
+        break
+    scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+                                                  # 把书签塞进下一次 scan 的参数
+```
+
+这是 DynamoDB Scan/Query 的**强制 idiom**，不分页就是 bug。
+
+#### 两个新手陷阱
+
+**陷阱 A：只拿第一页就完事**
+
+```python
+resp = table.scan(...)
+stale = resp.get("Items", [])    # ← bug：只是第一页
+```
+
+- 测试环境表小（< 1 MB）：偶然能 work，看起来正常
+- prod 表长大后：**只检查前 1 MB，后面的 stale 锁悄无声息漏掉**——告警逻辑还在跑、还偶尔报告，只是不全。这种"半静默 bug"很难被发现。
+
+**陷阱 B：用 `Items` 判断有没有更多页**
+
+```python
+while True:
+    resp = table.scan(**scan_kwargs)
+    if not resp["Items"]:    # ← bug：这一页过滤后是空，不代表表扫完了
+        break
+    ...
+```
+
+`ScannedCount`（实际扫的）和 `Count`（过滤后的）是两个不同概念。一页可能 `ScannedCount=2000` 但 `Count=0`（这一段根本没 stale 锁），表后面还有数据要扫。**判断"扫完了"唯一可靠的信号就是 `LastEvaluatedKey` 缺失**。
+
+当前代码用的就是 `if "LastEvaluatedKey" not in resp` 这个正确写法。
+
+#### 三个 count 字段的区分
+
+| 字段 | 含义 | 用途 |
+|---|---|---|
+| `ScannedCount` | 这次实际扫了多少 item | 计费基准 |
+| `Count` | 过滤后剩多少 item | == `len(Items)` |
+| 累加的 `len(stale)` | 所有页累计的过滤后命中 | 业务用的最终结果 |
+
+---
+
+## i) Snowflake Storage Integration（机制详解 + 为什么删掉了 SQL 文件）
+
+> ⚠️ **历史变更（2026-04-30）**：原 `snowflake_sql/02_storage_integration.sql` **已删除**。
+> 此对象**唯一**由 Terraform 管理 → [terraform/modules/snowflake/main.tf:201](terraform/modules/snowflake/main.tf#L201) 的 `snowflake_storage_integration.s3_int` 资源。
+> 删除原因见本节末尾"为什么删除 02_storage_integration.sql"小节。
+>
+> 本节保留 Storage Integration 的机制讲解，知识用于理解 Terraform 那个资源在做什么。
+
+### 这是什么
+
+Storage Integration = Snowflake 里的一个**对象**，作用是让 Snowflake **安全地访问 S3**——不用在 SQL 里硬写 AWS access key / secret key。它是 Snowpipe 和 External Stage 能去 S3 拉 parquet 的"通行证"。
+
+整条链路里它所处的位置：
+
+```
+[Glue Silver Job 写 S3 parquet]
+        ↓
+[S3 ObjectCreated → SNS]
+        ↓
+[Snowpipe]   ← 这一步要用 Terraform 创建的 Storage Integration
+        ↓ AssumeRole 拿临时凭据
+[GET S3 parquet → COPY INTO SILVER.DC_WIDE]
+```
+
+### 生活类比
+
+你（Snowflake）要去隔壁公司（AWS）的仓库（S3 桶）取货。两种取货方式：
+
+- **方式 A（不安全）**：你随身揣着一把万能钥匙，谁见到都能复制 → 等价于把 AWS access key 写在 SQL 里
+- **方式 B（安全）**：隔壁公司给你办一张"访客身份证"+ 一个"暗号"。每次去取货时出示身份证 + 念暗号，对方核对没问题才开门 → 这就是 IAM Role + External ID 模式
+
+Storage Integration 就是这张"访客身份证 + 暗号"在 Snowflake 这一侧的存根。
+
+### Terraform 资源逐字段拆解（[terraform/modules/snowflake/main.tf:201](terraform/modules/snowflake/main.tf#L201)）
+
+```hcl
+resource "snowflake_storage_integration" "s3_int" {
+  name                      = "IODP_DC_S3_INT_${local.env_upper}"
+  type                      = "EXTERNAL_STAGE"
+  enabled                   = true
+  storage_provider          = "S3"
+  storage_allowed_locations = ["s3://${var.silver_bucket_name}/"]
+  storage_aws_role_arn      = var.snowpipe_iam_role_arn != "" ? var.snowpipe_iam_role_arn : "arn:aws:iam::000000000000:role/placeholder"
+  comment                   = "S3 integration for Silver bucket — ${var.environment}"
+}
+```
+
+| 字段 | 含义 | 类比 |
+|---|---|---|
+| `IODP_DC_S3_INT_${ENV}` | Integration 的名字 | 访客身份证的"卡号" |
+| `TYPE = EXTERNAL_STAGE` | 用途：给 External Stage / Snowpipe 用 | 身份证的用途："仓库取货" |
+| `STORAGE_PROVIDER = 'S3'` | 对接 AWS S3（也可对接 Azure / GCS） | 仓库在哪家公司 |
+| `ENABLED = TRUE` | 启用 | 身份证当前有效 |
+| `STORAGE_AWS_ROLE_ARN` | AWS 那边为 Snowflake 准备的 IAM Role ARN | "对方公司给我办的角色编号" |
+| `STORAGE_ALLOWED_LOCATIONS` | 这张通行证只允许访问这一个 S3 桶/前缀 | 身份证只能进 1 号仓库，不能进 2 号 |
+
+### 为什么要 `STORAGE_ALLOWED_LOCATIONS`
+
+**最小权限原则的双保险**。即使 AWS IAM Role 给的权限范围过宽（比如能访问 5 个桶），Snowflake 这一侧仍然只允许这个 Integration 走到 silver 桶。哪怕有人用这个 Integration 去 `CREATE STAGE URL='s3://别的桶/'`，Snowflake 会在 SQL 层直接拒绝。
+
+### 创建之后的"对接动作"——Snowflake 自动生成两个值，要回贴到 AWS
+
+创建 Storage Integration 时（不管是 `CREATE STORAGE INTEGRATION` 还是 `terraform apply`），Snowflake 会**自动生成**两个值：
+
+| 自动生成的值 | 作用 |
+|---|---|
+| `STORAGE_AWS_IAM_USER_ARN` | Snowflake 那一侧的"内部 IAM User ARN"，每个 Snowflake 账号唯一 |
+| `STORAGE_AWS_EXTERNAL_ID` | 随机生成的"暗号"，每次重建对象都会变 |
+
+这两个值必须贴回 AWS 那个 IAM Role 的 Trust Policy 里，AWS 才认 Snowflake 来 AssumeRole：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "<贴 STORAGE_AWS_IAM_USER_ARN>" },
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {
+        "sts:ExternalId": "<贴 STORAGE_AWS_EXTERNAL_ID>"
+      }
+    }
+  }]
+}
+```
+
+**纯手工模式下**怎么拿这两个值：在 Snowflake 跑 `DESC INTEGRATION IODP_DC_S3_INT_<ENV>`，抄出来再去 AWS Console 改 Trust Policy。这就是被删掉的 02_storage_integration.sql 注释里说的流程。
+
+**Terraform 模式下**完全不需要人参与：`snowflake_storage_integration` 资源的 `storage_aws_iam_user_arn` 和 `storage_aws_external_id` 是 **resource attribute（输出属性）**，[main.tf:156-157](terraform/main.tf#L156-L157) 直接把它们喂给 snowpipe module，[snowpipe/main.tf:23,27](terraform/modules/snowpipe/main.tf#L23) 的 IAM Role Trust Policy 直接消费。`terraform apply` 一次性闭环。
+
+### Terraform 一次 apply 怎么打破"鸡生蛋蛋生鸡"
+
+表面上的循环依赖：
+
+- AWS IAM Role 的 Trust Policy 需要 Snowflake 的 IAM_USER_ARN + ExternalId
+- Snowflake Storage Integration 的 `storage_aws_role_arn` 需要 AWS IAM Role 的 ARN
+
+[main.tf:144-146](terraform/main.tf#L144-L146) 的注释明确写了破解办法：
+
+```hcl
+# Use predictable IAM role ARN to break circular dependency with snowpipe.
+# The snowpipe module creates this role with this exact name.
+snowpipe_iam_role_arn = "arn:aws:iam::${var.aws_account_id}:role/iodp-dc-snowpipe-s3-${var.environment}"
+```
+
+**核心点：IAM Role 的 ARN 是可预测的字符串**，格式 `arn:aws:iam::<账号>:role/<名字>`，账号 ID 你早就知道、名字是你自己定的命名规范。所以即使 IAM Role 还没建出来，你也能**先拼一个 ARN 字符串**塞给 Snowflake。Snowflake 创建 Integration 时**只把 ARN 当字符串存下来，不会去 AWS 验证 Role 是否真的存在**——验证发生在第一次实际 AssumeRole 时。
+
+Terraform 的 DAG 顺序：
+
+```
+snowflake_storage_integration（用拼出来的 ARN 字符串）
+    ↓ 输出真实的 storage_aws_iam_user_arn + storage_aws_external_id
+aws_iam_role（用上面的 outputs 写 Trust Policy；名字正好就是上面拼的那个）
+    ↓
+两边对上 ✓ —— 一次 apply 完成
+```
+
+### Snowpipe 真正用到这把"通行证"是在什么时候
+
+接 §g 的端到端追踪，Snowpipe 收到 S3 ObjectCreated 通知之后：
+
+```
+1. Snowpipe 找到 IODP_DC_S3_INT_PROD 这个 Integration
+2. 用自己的身份（STORAGE_AWS_IAM_USER_ARN）向 AWS STS 请求:
+     AssumeRole(
+       RoleArn    = arn:aws:iam::123456789012:role/iodp-dc-snowpipe-s3-prod,
+       ExternalId = ABC12345_SFCRole=2_xyzRandomString==
+     )
+3. AWS STS 校验:
+     - 这个 IAM User 在 Trust Policy 的 Principal 里 ✓
+     - ExternalId 匹配 Condition ✓
+   → 颁发 ~15 分钟有效的临时 access key + secret + session token
+4. Snowpipe 拿临时凭据 s3:GetObject 拉 parquet
+5. 解析 parquet → COPY INTO SILVER.DC_WIDE
+6. 临时凭据快过期了，下一次要拉文件时再 AssumeRole 一次
+```
+
+整个链路里 **Snowflake 账号和 AWS 账号之间没有任何长期密钥流动**，只有 15 分钟级别的临时凭据。轮换、撤销、审计都比 access key 模式干净得多。
+
+### 为什么需要 External ID（"暗号"）
+
+防 **confused deputy 攻击**。如果只校验 Principal.AWS 不校验 ExternalId，理论上：
+
+1. 别的 Snowflake 账号 X（比如某竞争对手）知道了你的 IAM Role ARN（IAM Role ARN 不算秘密，可能在文档/截图里泄露）
+2. X 在自己的 Snowflake 里 `CREATE STORAGE INTEGRATION` 指向你的 Role ARN
+3. 如果你的 Trust Policy 没要求 ExternalId，X 用自己 Snowflake 的 IAM User 去 AssumeRole 也能成功
+4. → X 用你的 IAM Role 权限读你的 S3 ⚠️
+
+加了 ExternalId 之后：X 拿到的 ExternalId 是 X 自己 Snowflake 生成的（跟你的不一样），AssumeRole 在 STS 这一层就被拒。**ExternalId 是"只有 Snowflake 和 AWS 双方知道"的对暗号**。
+
+### ⚠️ ExternalId 重建的副作用
+
+不管用 SQL 的 `CREATE OR REPLACE` 还是 Terraform 的资源 destroy/recreate，**Snowflake 都会重新生成 ExternalId**。后果：
+
+- 老的 ExternalId 立即失效；AWS 那边的 Trust Policy 如果没同步更新 → Snowpipe 立刻停摆，Silver 层数据停止灌进 Snowflake
+- Terraform 模式下，`snowflake_storage_integration` 的 `force_new` 字段触发时（如重命名）会重建对象，连带 `aws_iam_role.assume_role_policy` 也跟着 in-place update → 一次 apply 内闭环，无人工干预
+- 不想触发重建时：改 `storage_allowed_locations` 之类的字段在 Terraform 里是 in-place update（背后是 `ALTER STORAGE INTEGRATION`），不会重置 ExternalId，安全
+- 手工 SQL 模式下：用 `ALTER STORAGE INTEGRATION ... SET ...`，**避免** `CREATE OR REPLACE`
+
+### 为什么删除 `snowflake_sql/02_storage_integration.sql`
+
+发现：
+
+| 对象 | SQL 文件 | Terraform |
+|---|---|---|
+| `IODP_DC_S3_INT_<ENV>` | `CREATE OR REPLACE STORAGE INTEGRATION ...`（已删） | `snowflake_storage_integration.s3_int`（保留） |
+| AWS IAM Role + Trust Policy | 注释里说"DESC INTEGRATION → 抄值 → 手动贴" | `aws_iam_role.snowpipe_s3_access` 直接消费 module outputs |
+
+两者管同一个 Snowflake 对象，行为重叠。**留着 SQL 的具体风险**：
+
+1. **ExternalId 被偷偷重置 → Snowpipe 停摆**：`apply_snowflake_sql.sh` 用 `[0-9]*.sql` 通配符按文件名顺序跑（[scripts/apply_snowflake_sql.sh:24](scripts/apply_snowflake_sql.sh#L24)）。如果有人做日常 schema 变更（比如改 03/04/05），跑 `make apply-snowflake-sql` → 02 也会被一起跑 → `CREATE OR REPLACE` → ExternalId 重置，Trust Policy 来不及更新 → 生产 Snowpipe 立即 403。
+2. **配置漂移**：SQL 里 ALLOWED_LOCATIONS 写法是 `s3://iodp-dc-silver-${ENV_LOWER}-${AWS_ACCOUNT_ID}/`，Terraform 里是 `s3://${var.silver_bucket_name}/`。表面同义，但桶名变更时（如 rebrand）两边只改一边就漂移了。
+3. **IaC 边界含糊**：同一对象两套 source of truth，code review 时不知道改哪边。
+
+**结论**：Storage Integration 由 Terraform 唯一管。SQL 文件删除。
+
+#### Terraform 已有这条注释（[modules/snowpipe/main.tf:8-9](terraform/modules/snowpipe/main.tf#L8-L9)）
+
+```
+# Note: The actual Snowflake Pipe/Stage/FileFormat objects are created via
+# snowflake_sql/04_pipe.sql, not Terraform (provider limitations with AUTO_INGEST).
+```
+
+意思是 **04_pipe.sql 这种**才是真正"Terraform provider 能力不够、必须留 SQL"的对象（AUTO_INGEST Pipe 有些字段 Terraform Snowflake provider 当时不支持）。Storage Integration 不属于这一类——provider 完全支持，没理由留 SQL。
+
+### 一句话总结
+
+Storage Integration 是 **Snowflake → AWS 的安全握手凭据**。本项目由 [terraform/modules/snowflake/main.tf:201](terraform/modules/snowflake/main.tf#L201) 唯一管理，配合 [terraform/modules/snowpipe/main.tf:15](terraform/modules/snowpipe/main.tf#L15) 的 IAM Role 一次 apply 闭环。原 SQL 文件 02_storage_integration.sql 在 2026-04-30 删除，原因是与 Terraform 重复 + `CREATE OR REPLACE` 有偷偷重置 ExternalId 的隐患。
+
+---
+
+## j) 稀疏 GSI 改造：把"全表扫描"换成"精准 Query"
+
+> §h 末尾提到 stale-lock Lambda 用 Scan + FilterExpression 找跑飞的锁——表大了会变贵变慢。本节讲我们怎么提前消掉这个潜在瓶颈：让"业务字段"和"GSI 索引字段"分家，再加一个稀疏 GSI 让 Lambda 直接 Query 命中。
+
+### 这是什么
+
+把 checkpoint 表里 **`status` 字段**从"长期保存"改成"只在跑动时存在"。Job 完成的时候**物理删除** `status`，把"上一轮结果"挪到一个新的 `last_status` 字段里。然后给 `status` 建一个 GSI——因为 DynamoDB 的 GSI 只索引"含有 GSI key 的 item"，没有 status 字段的 item 不进 GSI，索引天然变得"稀疏"，永远只装当下在跑的那几条。
+
+### 生活类比
+
+公司前台一本"今天还在开会的人"登记簿。
+
+- **改造前**：登记簿就是公司全员名册。每个人下面都有"会议状态"一栏，写着"开会中 / 已散会 / 在工位"。前台要找跑飞的会议得从头翻到尾，逐个看"开会中"的人结束时间是不是过了。员工越多翻得越慢。
+
+- **改造后**：登记簿拆成两本：
+  - **全员名册**（主表）：状态栏只在你"正在开会"的时候才填字；开完会前台**用涂改液把状态栏刷白**，连带"会议结束时间"一起刷掉。
+  - **开会中索引**（稀疏 GSI）：自动只收录"状态栏有字的人"。
+  
+  前台找跑飞的会议直接翻索引——名册再厚也不影响，索引永远只有当下在开会的几个人。
+
+### 设计要点：两个字段分别管两件事
+
+```
+┌─ 运行期字段（Job 跑的时候才存在，release 时 REMOVE）─┐
+│  status            = "running"                       │
+│  lock_expires_at   = ISO 时间戳 (lock TTL)           │
+└──────────────────────────────────────────────────────┘
+
+┌─ 完成态字段（持久保留，跨次运行不丢）─────────────────┐
+│  last_status       = "succeeded" / "failed"          │
+│  last_processed_at, file_md5s, in_count, out_count,  │
+│  dlq_count, input_files, job_run_id                  │
+└──────────────────────────────────────────────────────┘
+```
+
+为什么必须拆成两个字段、不能在一个 `status` 上做文章？
+
+- 单字段方案：`status` 同时表达"在跑"和"上次跑完是什么结果"——两件事一旦合在一起，GSI 里就永远塞着所有完成态 item（"succeeded" / "failed" 也是 status 值），"稀疏"就是空话。
+- 双字段方案：`status` 只表达"正在跑"；上次的结果由 `last_status` 表达。两件事各管一摊，GSI 才能真正稀疏。
+
+### 改动 1：release_lock 用 UpdateItem REMOVE
+
+```python
+# 旧：put_item 整体写一遍，status="succeeded" 留在 item 里
+# 新：update_item，REMOVE 掉运行期字段，SET last_status
+update_expr = (
+    "SET last_status = :ls, last_processed_at = :ts, ... "
+    "REMOVE #s, lock_expires_at"
+)
+table.update_item(Key={"partition_key": pk}, UpdateExpression=update_expr, ...)
+```
+
+**举例**：bronze 处理 4/25 ios 完成时，DynamoDB item 字段对比：
+
+| 字段 | 处理前（running 状态） | 旧设计完成后 | 新设计完成后 |
+|---|---|---|---|
+| `partition_key` | `bronze#2026-04-25#ios` | 同左 | 同左 |
+| `status` | `"running"` | `"succeeded"` | **(无此字段)** |
+| `lock_expires_at` | `2026-04-25T12:00Z` | `1970-01-01T00:00Z`（哑值） | **(无此字段)** |
+| `last_status` | (无) | (无此字段) | `"succeeded"` |
+| `file_md5s` | (无) | `{...}` | `{...}` |
+
+新设计里 `status` 字段被物理删除——这条 item 立刻从 `status-index` GSI 里消失。
+
+### 改动 2：acquire_lock 的 ConditionExpression 简化成两条
+
+```python
+ConditionExpression="attribute_not_exists(#s) OR lock_expires_at < :now"
+```
+
+为什么是这两条？穷举所有可能的初始状态：
+
+| 当前 item 状态 | `attribute_not_exists(#s)` | `lock_expires_at < :now` | 能否抢锁 |
+|---|---|---|---|
+| 全新分区（item 不存在） | ✅ true | (无属性) | ✅ |
+| 上一轮成功完成（status 已 REMOVE） | ✅ true | (无属性) | ✅ |
+| 上一轮失败（status 已 REMOVE） | ✅ true | (无属性) | ✅ |
+| 当前正在跑，锁未过期 | ❌ false (status="running") | ❌ false (未来时间) | ❌ |
+| 上一轮崩溃，锁已过期 | ❌ false (status="running") | ✅ true | ✅ |
+
+> ⚠️ 为什么不能用旧的 `#s <> :running`？DynamoDB 对**缺失属性**的比较返回 false（不是 true）。完成态 item 的 status 已被 REMOVE，`#s <> :running` 既不命中也不报错，整条 OR 走不通。所以**必须**用 `attribute_not_exists(#s)` 替代。
+
+### 改动 3：needs_reprocess 改读 last_status
+
+```python
+if item.get("last_status") != "succeeded":
+    return True  # 上一轮没成功 → 重处理
+```
+
+**三种实际情况**：
+
+| 上一轮发生了什么 | item 里 last_status 是什么 | 行为 |
+|---|---|---|
+| 成功完成 | `"succeeded"` | 接下来比 file_md5s |
+| release 时写了 failed | `"failed"` | 直接重处理 |
+| 崩溃（acquire 后 release 前挂掉） | (字段不存在) | 直接重处理 |
+
+第三种情况要展开：acquire_lock 用的是 `put_item`，**整个 item 都被替换成 4 个字段**（status, lock_expires_at, last_processed_at, job_run_id），原来的 `last_status` 和 `file_md5s` 全没了。这是**故意保留的**老行为——崩溃后 file_md5s 缺失，下一轮 needs_reprocess 即使不看 last_status 也会因为 MD5 对不上而重处理，正好兜底。
+
+### 改动 4：silver 检查 bronze 的 last_status
+
+```python
+bronze_ckpt = checkpoint.get_checkpoint("bronze", dt, store)
+if not bronze_ckpt or bronze_ckpt.get("last_status") != "succeeded":
+    return  # 跳过
+```
+
+**为什么不需要显式检查 `status == "running"`**？因为 bronze 在跑时 put_item 已经把 `last_status` 清掉了。silver 读到的 `last_status` 是 None → `None != "succeeded"` → 跳过。一行检查同时覆盖三种情况：bronze 没记录、bronze 在跑、bronze 上次失败。
+
+**举例**：
+
+| 场景 | bronze item 内容 | silver 看到的 last_status | silver 行为 |
+|---|---|---|---|
+| bronze 还在跑 4/25 ios | `status="running"`, last_status 不存在 | `None` | 跳过 ✓ |
+| bronze 4/25 ios 已成功 | `last_status="succeeded"`, file_md5s={...} | `"succeeded"` | 进入处理 ✓ |
+| bronze 4/25 ios 上次失败 | `last_status="failed"` | `"failed"` | 跳过 ✓ |
+| bronze 从未处理过 4/25 ios | (整条 item 不存在) | (`bronze_ckpt is None` 分支) | 跳过 ✓ |
+
+### 改动 5：Lambda 从 Scan 改成 Query GSI
+
+```python
+# 旧：Scan 全表 + FilterExpression
+table.scan(
+    FilterExpression="#s = :running AND lock_expires_at < :now",
+    ...
+)
+
+# 新：直接 Query 稀疏 GSI
+table.query(
+    IndexName="status-index",
+    KeyConditionExpression=Key("status").eq("running") & Key("lock_expires_at").lt(now_iso),
+)
+```
+
+**规模对比**（假设 3 年累计 ~4400 行，当下在跑 0~4 条）：
+
+| 维度 | Scan + Filter（旧） | Query GSI（新） |
+|---|---|---|
+| 扫描的 item 数 | 4400（全表） | 0~4（GSI 里就这么多） |
+| 计费基准 ScannedCount | 4400 | 0~4 |
+| RCU 消耗 | 跟主表行数线性增长 | 跟当下在跑的 Job 数线性增长（≈ 恒定） |
+| 延迟 | 表大了要分页 | 单次 Query 命中 |
+
+> ⚠️ **主要动机不是省钱**——当前规模 Scan 一次也就 ~$0.0000625，每月 $3。真正动机是**让告警延迟和 RCU 消耗跟主表大小解耦**，将来表再大也不会冒头。
+
+### 改动 6：Terraform 加 GSI 定义 + IAM 收紧
+
+```hcl
+# modules/dynamodb/main.tf
+attribute { name = "status";          type = "S" }
+attribute { name = "lock_expires_at"; type = "S" }
+global_secondary_index {
+  name            = "status-index"
+  hash_key        = "status"
+  range_key       = "lock_expires_at"
+  projection_type = "INCLUDE"
+  non_key_attributes = ["partition_key", "last_processed_at", "job_run_id"]
+}
+```
+
+```hcl
+# modules/observability/main.tf — Lambda IAM
+Action   = ["dynamodb:Query"]                       # 之前: ["dynamodb:Scan"]
+Resource = [var.checkpoint_status_index_arn]        # 之前: 主表 ARN
+```
+
+两处收紧：
+
+1. **Action**：`Scan` → `Query`，权限粒度变小。
+2. **Resource**：主表 ARN → GSI ARN。Lambda 只能查 GSI，**碰不到主表数据**——符合最小权限原则。万一 Lambda 代码里被注入了 `table.scan()`，IAM 直接拒绝。
+
+`projection_type = "INCLUDE"` 是个 GSI 优化项：告诉 DynamoDB GSI 里除了 PK/SK 还要冗余存哪几列。Lambda 告警邮件需要 `partition_key, last_processed_at, job_run_id`，所以这 3 列也存进 GSI 一份；如果用 `KEYS_ONLY`，Lambda Query 完拿不到这些字段，还得回主表 GetItem，徒增 RCU。
+
+### 端到端追踪：一个分区的完整生命周期
+
+跟踪 `(layer=bronze, dt=2026-04-25, store=ios)` 这条 item 在新设计下的状态变化：
+
+```
+T0  10:00:00  EventBridge 触发 Bronze Job
+              │
+              ▼
+T1  10:00:05  acquire_lock: put_item
+              ┌─────────────────────────────────────────┐
+              │ partition_key:    bronze#2026-04-25#ios │
+              │ status:           "running"   ← 在 GSI │
+              │ lock_expires_at:  2026-04-25T12:00:00Z │
+              │ last_processed_at: 2026-04-25T10:00:05Z │
+              │ job_run_id:       jr_abc123              │
+              └─────────────────────────────────────────┘
+              ※ stale-lock Lambda 此刻 Query GSI 能看到这条
+                但 lock_expires_at < now 不成立（12:00 > 现在）→ 不告警
+
+T2  10:30:00  Lambda 30 分钟周期触发，Query GSI:
+              KeyCondition: status="running" AND lock_expires_at < "2026-04-25T10:30:00Z"
+              → 12:00 不小于 10:30 → 命中 0 条 → 无告警
+
+T3  10:15:00  release_lock("succeeded"): update_item
+              ┌─────────────────────────────────────────┐
+              │ partition_key:     bronze#2026-04-25#ios │
+              │ (status REMOVED)  ← 从 GSI 消失         │
+              │ (lock_expires_at REMOVED)               │
+              │ last_status:       "succeeded"           │
+              │ last_processed_at: 2026-04-25T10:15:00Z │
+              │ in_count:          850000000             │
+              │ out_count:         849999500             │
+              │ file_md5s:         {...}                 │
+              │ job_run_id:        jr_abc123             │
+              └─────────────────────────────────────────┘
+              ※ GSI 现在 0 条，Lambda 怎么 Query 都查不到这条
+
+T4  次日10:00 第二天 Bronze Job
+              ① needs_reprocess: 读到 last_status="succeeded"
+                 → 进入 file_md5s 比对
+              ② 假设 dropzone MD5 没变 → 跳过该分区，不调 acquire_lock
+              ③ item 状态保持 T3 的样子，不变
+```
+
+### 崩溃恢复路径（最关键的健壮性场景）
+
+```
+T0  10:00:00  Bronze acquire_lock → put_item 替换整个 item
+              status="running", lock_expires_at=12:00
+              ★ file_md5s / last_status 字段被 put_item 清掉了
+
+T1  10:30:00  Glue Job OOM 崩溃，cleanup 没跑
+              DynamoDB item 还停留在 status="running"
+
+T2  12:00:00  AWS Glue Timeout（120 分钟）兜底强杀进程
+              进程死了，DynamoDB 里 status 仍是 "running"
+
+T3  12:30:00  stale-lock Lambda 周期触发
+              Query GSI: status="running" AND lock_expires_at < "12:30"
+              ★ 命中这条（12:00 < 12:30）→ 发告警邮件给 oncall
+
+T4  次日10:00 第二天 Bronze Job 启动该分区
+              ① needs_reprocess:
+                 - last_status 字段不存在（T0 被 put_item 清掉）
+                 - last_status != "succeeded" → 返回 True，要重处理
+              ② acquire_lock:
+                 - attribute_not_exists(#s) → false（status="running" 还在）
+                 - lock_expires_at < now → true（昨天 12:00 早过了）
+                 - 抢锁成功 ✓
+              ③ 处理完 release_lock → status REMOVE，从 GSI 消失，告警状态自然恢复
+```
+
+### 成本与代价
+
+| 项目 | 大小 |
+|---|---|
+| 主表多了 `last_status` 字段 | ~10 字节/item，4400 行 ≈ 44KB |
+| GSI 存储（KEYS + INCLUDE 3 列） | 同时刻在跑 ≤ 4 条，≈ 2KB |
+| GSI 写入开销 | acquire/release 各触发 1 次 GSI 同步，PAY_PER_REQUEST 计费可忽略 |
+| Lambda RCU | 从 ~250/次 (Scan) 降到 1/次 (Query GSI) |
+
+写入开销解释一下：每次 acquire_lock / release_lock 都会让 DynamoDB 在主表写完后**异步同步一次 GSI**（不阻塞主表写返回）。同步本身要花 1 WCU——主表 1 WCU + GSI 1 WCU = 2 WCU per write。On-Demand 模式下每天 ~30 次 Job × 2 = 60 WCU/天，每月 0.0X 美分级别，可忽略。
+
+### 一句话回答
+
+| 问题 | 答案 |
+|---|---|
+| 为什么不直接给主表加 GSI 就完了？ | 单字段 status 同时表达"在跑"和"历史结果"时，GSI 里永远塞着所有完成态 item，根本没法稀疏。必须把两件事拆成两个字段。 |
+| 老的 `status="succeeded"` 设计有什么本质区别？ | 老设计：完成态 item 在 GSI 里，Lambda 必须再加 FilterExpression 才能过滤；GSI 大小跟主表一起涨。新设计：完成态 item 不进 GSI，KeyCondition 直接精确匹配，永远只扫"现在跑着的几条"。 |
+| 为什么 acquire_lock 还用 put_item？ | 故意保留"整个 item 替换"的语义——崩溃后 file_md5s 自动消失，next run 一定重处理；不需要额外的恢复逻辑。 |
+| silver 检查 bronze 状态为什么不需要显式查 status="running"？ | 因为 bronze 在跑时 put_item 已经把 `last_status` 清掉，silver 看到 last_status 缺失 → 一行 `last_status != "succeeded"` 就把"在跑"和"上次失败"和"从没跑过"全覆盖了。 |
+| GSI 的 PROJECTION_TYPE 为什么用 INCLUDE 而不是 KEYS_ONLY？ | Lambda 告警邮件要打印 partition_key / last_processed_at / job_run_id；KEYS_ONLY 只投影 PK+SK，告警 Lambda 拿不到这些字段就要再回主表 GetItem，徒增 RCU。INCLUDE 多冗余 3 列，告警 Lambda 一次 Query 够用。 |
+
+---
+
 ## 总结：这五个机制互相怎么配合
 
 ```
@@ -933,3 +1575,79 @@ EventBridge 每日 UTC 10:00 触发
     │                        │
     └─ (d) 延迟告警          └─ (e) AUTO_SUSPEND + MAX_CLUSTER
 ```
+
+---
+
+## Snowflake ↔ Snowpipe 模块的数据流与循环依赖
+
+### 1. `storage_aws_iam_user_arn` 是 Snowflake 自动生成的
+
+在 [terraform/modules/snowflake/main.tf:201-211](terraform/modules/snowflake/main.tf#L201-L211) 创建 `snowflake_storage_integration.s3_int` 时，Snowflake 会在自己的 AWS 账户里**自动绑定一个 IAM user**（每个 integration 一个），并返回这个 user 的 ARN 和一个 external_id。
+
+所以这两个属性是 Snowflake 端**计算出来的（computed）输出**，不是用户输入的：
+
+- `snowflake_storage_integration.s3_int.storage_aws_iam_user_arn` → Snowflake 端的 IAM user
+- `snowflake_storage_integration.s3_int.storage_aws_external_id` → Snowflake 生成的 external ID
+
+部署后可以在 Snowflake 中验证：
+
+```sql
+DESC INTEGRATION IODP_DC_S3_INT_<ENV>;
+-- 会看到 STORAGE_AWS_IAM_USER_ARN 和 STORAGE_AWS_EXTERNAL_ID
+```
+
+### 2. 完整数据流
+
+```
+1. snowflake_storage_integration.s3_int 创建
+        ↓
+   Snowflake 在自己 AWS 账户里自动生成 IAM user + external_id
+        ↓
+2. Terraform provider 把这两个值读回来，存到 state 里：
+   - storage_aws_iam_user_arn
+   - storage_aws_external_id
+        ↓
+3. snowflake module 通过 outputs.tf 把它们暴露出去
+        ↓
+4. 根 main.tf 把它们作为输入传给 snowpipe module：
+   snowflake_iam_user_arn = module.snowflake.storage_aws_iam_user_arn
+   snowflake_external_id  = module.snowflake.storage_aws_external_id
+        ↓
+5. snowpipe module 用它们去构造 AWS IAM role 的 trust policy
+   （让 Snowflake 那个 IAM user 能 AssumeRole 进来读 Silver bucket）
+```
+
+参见：
+- [terraform/modules/snowflake/outputs.tf:39-47](terraform/modules/snowflake/outputs.tf#L39-L47) — 暴露两个 computed 属性
+- [terraform/main.tf:155-156](terraform/main.tf#L155-L156) — 传给 snowpipe module
+
+### 3. Terraform 自动处理的两件事
+
+1. **依赖顺序**：因为 `module.snowpipe` 引用了 `module.snowflake.xxx`，Terraform 自动推断**先创建 snowflake，再创建 snowpipe**，无需写 `depends_on`。
+
+2. **值的传递**：output 不是"导出文件"，而是 Terraform 内存里的 attribute。整个 `terraform apply` 一次性串联所有 module，snowpipe module 拿到的就是 Snowflake 真实返回的、最新的值。
+
+### 4. 循环依赖与解法
+
+`snowflake` 和 `snowpipe` 这两个 module 之间存在天然的双向依赖：
+
+| 方向 | 需要什么 |
+|------|---------|
+| snowflake → 需要 AWS role ARN | 写在 `storage_aws_role_arn` 上 |
+| snowpipe → 需要 Snowflake IAM user ARN | 写在 AWS role 的 trust policy 上 |
+
+如果两个方向都写成 `module.xxx.yyy` 引用，Terraform 会报**循环依赖错误**，apply 失败。
+
+**解法：打破其中一个方向，用"约定好的可预测字符串"代替真正的 output 引用。**
+
+在 [terraform/main.tf:145](terraform/main.tf#L145)，snowflake module 收到的 `snowpipe_iam_role_arn` 是手写拼出来的 ARN 字符串，而不是 `module.snowpipe.role_arn`：
+
+```hcl
+snowpipe_iam_role_arn = "arn:aws:iam::${var.aws_account_id}:role/iodp-dc-snowpipe-s3-${var.environment}"
+```
+
+为什么选这个方向打破环：
+
+- **snowflake → snowpipe** 用真 output：因为 IAM user ARN 和 external_id 是 Snowflake **随机生成**的，无法预测，必须等 integration 创建出来才能拿到。
+- **snowpipe → snowflake** 用预测字符串：因为 AWS IAM role 的名字是我们**自己定的**，可以提前约定。snowpipe module 创建 role 时必须使用与该字符串完全一致的名字，否则 Snowflake 那边的 trust 关系就对不上。
+

@@ -9,8 +9,17 @@ DynamoDB Checkpoint + 并发锁
 
 DynamoDB 表 Schema:
   PK: partition_key  (String)  格式: "<layer>#<dt>#<store>"
-  Attributes: status, lock_expires_at, last_processed_at, input_files,
-              file_md5s, in_count, out_count, dlq_count, job_run_id
+  运行期字段（Job 跑动时存在，release 时 REMOVE 掉）:
+    status            "running"
+    lock_expires_at   ISO 时间戳（lock TTL）
+  完成态字段:
+    last_status       "succeeded" / "failed"
+    last_processed_at, input_files, file_md5s, in_count, out_count,
+    dlq_count, job_run_id
+
+GSI: status-index (PK=status, SK=lock_expires_at)
+  稀疏索引：只索引"含 status 字段"的 item，即当下在跑的几条。
+  stale-lock Lambda 用 Query 命中，无需 Scan 全表。
 """
 
 import hashlib
@@ -95,6 +104,9 @@ class CheckpointManager:
         ).isoformat()
 
         try:
+            # put_item 替换整个 item：crash 后 file_md5s 一并消失，
+            # 下一轮 needs_reprocess 自动重处理。
+            # 条件二选一即可获锁：上一轮已 release（status 被 REMOVE），或锁过期（崩溃）。
             self._table.put_item(
                 Item={
                     "partition_key": pk,
@@ -103,16 +115,9 @@ class CheckpointManager:
                     "last_processed_at": now,
                     "job_run_id": job_run_id,
                 },
-                ConditionExpression=(
-                    "attribute_not_exists(partition_key) "
-                    "OR #s <> :running "
-                    "OR lock_expires_at < :now"
-                ),
+                ConditionExpression="attribute_not_exists(#s) OR lock_expires_at < :now",
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":running": "running",
-                    ":now": now,
-                },
+                ExpressionAttributeValues={":now": now},
             )
             logger.info("Lock acquired for %s (job_run_id=%s)", pk, job_run_id)
             return True
@@ -138,29 +143,48 @@ class CheckpointManager:
         file_md5s: Optional[Dict[str, str]] = None,
         job_run_id: str = "",
     ) -> None:
-        """处理完成后更新 checkpoint 并释放锁。"""
+        """
+        处理完成后释放锁：UpdateItem REMOVE 掉 status / lock_expires_at
+        （让 item 脱离稀疏 GSI status-index），SET last_status 记录最终结果。
+        """
         pk = _make_partition_key(layer, dt, store)
 
-        item = {
-            "partition_key": pk,
-            "status": status,
-            "last_processed_at": _now_iso(),
-            "in_count": in_count,
-            "out_count": out_count,
-            "dlq_count": dlq_count,
-            "job_run_id": job_run_id,
+        # 构造 UpdateExpression: REMOVE 运行期字段, SET 完成态字段
+        update_set_parts = [
+            "last_status = :ls",
+            "last_processed_at = :ts",
+            "in_count = :ic",
+            "out_count = :oc",
+            "dlq_count = :dc",
+            "job_run_id = :jr",
+        ]
+        attr_values = {
+            ":ls": status,
+            ":ts": _now_iso(),
+            ":ic": in_count,
+            ":oc": out_count,
+            ":dc": dlq_count,
+            ":jr": job_run_id,
         }
-        # 清除锁的过期时间
-        if status != "running":
-            item["lock_expires_at"] = "1970-01-01T00:00:00Z"
-
         if input_files:
-            item["input_files"] = input_files
+            update_set_parts.append("input_files = :if")
+            attr_values[":if"] = input_files
         if file_md5s:
-            item["file_md5s"] = file_md5s
+            update_set_parts.append("file_md5s = :md")
+            attr_values[":md"] = file_md5s
 
-        self._table.put_item(Item=item)
-        logger.info("Checkpoint updated for %s: status=%s", pk, status)
+        update_expr = (
+            "SET " + ", ".join(update_set_parts)
+            + " REMOVE #s, lock_expires_at"
+        )
+
+        self._table.update_item(
+            Key={"partition_key": pk},
+            UpdateExpression=update_expr,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues=attr_values,
+        )
+        logger.info("Checkpoint updated for %s: last_status=%s", pk, status)
 
     def needs_reprocess(
         self,
@@ -191,8 +215,11 @@ class CheckpointManager:
             logger.info("No checkpoint for %s — new data, needs processing", pk)
             return True
 
-        if item.get("status") == "failed":
-            logger.info("Previous run failed for %s — needs reprocessing", pk)
+        if item.get("last_status") != "succeeded":
+            logger.info(
+                "Previous run for %s last_status=%s — needs reprocessing",
+                pk, item.get("last_status"),
+            )
             return True
 
         old_md5s = item.get("file_md5s", {})

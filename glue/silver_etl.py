@@ -176,8 +176,9 @@ def process_partition(dt: str, store: str):
     start_time = time.time()
 
     # ─── 1. 检查 Bronze checkpoint 确认这个分区已处理成功 ───
+    # bronze 在跑时 last_status 不存在（put_item 已清掉），自动跳过。
     bronze_ckpt = checkpoint.get_checkpoint("bronze", dt, store)
-    if not bronze_ckpt or bronze_ckpt.get("status") != "succeeded":
+    if not bronze_ckpt or bronze_ckpt.get("last_status") != "succeeded":
         print(f"[SKIP] silver/{dt}/{store} — Bronze not succeeded")
         return
 

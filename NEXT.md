@@ -11,8 +11,10 @@
 0.  现在        lambda/stale_lock_check
                 趁 Glue checkpoint/锁上下文还热
 
-1.  snowflake_sql/02_storage_integration.sql
+1.  terraform/modules/snowflake/main.tf:201（snowflake_storage_integration）
+    + terraform/modules/snowpipe/main.tf（IAM Role + Trust Policy）
                 Snowflake ↔ S3 凭证打通（不通这个 Snowpipe 跑不起来）
+                原 snowflake_sql/02_storage_integration.sql 已删除，与 Terraform 重复
 
 2.  snowflake_sql/03_silver_table.sql
                 Silver 目标表 DDL —— 与 Glue WIDE_V2_SCHEMA 对契约
@@ -48,9 +50,16 @@
   - 一个是"历史持有者死了没释放"
   - 告警文案别混
 
-### 1. snowflake_sql/02_storage_integration.sql
+### 1. Storage Integration（Terraform 管，不再有 SQL）
 - IAM 信任关系的 `STORAGE_AWS_EXTERNAL_ID` 是写死还是动态生成？
-  写死 → 跨环境（dev/staging/prod）复制时有覆盖风险
+  → Snowflake 在创建 storage integration 时**自动生成**，每次资源 destroy/recreate 都会变
+  → Terraform 把它作为 resource attribute 直接喂给 aws_iam_role.assume_role_policy
+    （main.tf:156-157），无人工介入
+- 跨环境复制风险：每个 env 的 integration 名字不同（IODP_DC_S3_INT_DEV / _PROD），
+  ExternalId 各自独立生成，无覆盖风险
+- 隐患：如果有人在 Terraform 之外手工 `CREATE OR REPLACE STORAGE INTEGRATION`，
+  ExternalId 会重置但 AWS Trust Policy 不会跟着改 → Snowpipe 立刻 403。
+  这就是 02_storage_integration.sql 被删的原因之一。
 
 ### 2. snowflake_sql/03_silver_table.sql
 - 列名/类型 vs Glue 输出的 `WIDE_V2_SCHEMA`（`glue/lib/schema_v2_wide.py`）一致吗？

@@ -184,9 +184,10 @@ resource "aws_iam_role_policy" "stale_lock_lambda" {
     Version = "2012-10-17"
     Statement = [
       {
+        # Lambda 走 sparse GSI Query，无需 Scan 主表。Resource 只授权 GSI ARN。
         Effect   = "Allow"
-        Action   = ["dynamodb:Scan"]
-        Resource = [var.checkpoint_table_arn]
+        Action   = ["dynamodb:Query"]
+        Resource = [var.checkpoint_status_index_arn]
       },
       {
         Effect   = "Allow"

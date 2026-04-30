@@ -470,7 +470,7 @@ download_channel/
 │
 ├── snowflake_sql/
 │   ├── 01_database_schemas.sql
-│   ├── 02_storage_integration.sql
+│   │   (Storage Integration 由 Terraform 管，见 modules/snowflake/main.tf)
 │   ├── 03_silver_table.sql                 ← DC_WIDE（1 张表）
 │   ├── 04_pipe.sql                         ← PIPE_DC_WIDE（1 条 Pipe）
 │   ├── 05_gold_dynamic_tables.sql
