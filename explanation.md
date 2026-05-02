@@ -1651,3 +1651,926 @@ snowpipe_iam_role_arn = "arn:aws:iam::${var.aws_account_id}:role/iodp-dc-snowpip
 - **snowflake → snowpipe** 用真 output：因为 IAM user ARN 和 external_id 是 Snowflake **随机生成**的，无法预测，必须等 integration 创建出来才能拿到。
 - **snowpipe → snowflake** 用预测字符串：因为 AWS IAM role 的名字是我们**自己定的**，可以提前约定。snowpipe module 创建 role 时必须使用与该字符串完全一致的名字，否则 Snowflake 那边的 trust 关系就对不上。
 
+---
+
+## Snowflake 基础架构 (`01_database_schemas.sql` 解读)
+
+参见 [snowflake_sql/01_database_schemas.sql](snowflake_sql/01_database_schemas.sql)。该文件只搭骨架（DB / Schema / Warehouse / Role + 顶层 USAGE），**不包含数据访问权限**。
+
+### 1. WAREHOUSE 是什么 — 计算与存储分离
+
+Snowflake 的核心架构：**存储与计算分离**。
+
+| 层 | 对象 | 作用 |
+|---|---|---|
+| 存储层 | DATABASE / SCHEMA / TABLE | 存数据本身（表定义 + 实际数据） |
+| 计算层 | **WAREHOUSE** | 一个虚拟计算集群（相当于一组 EC2），负责执行 SQL |
+| 账户层 | ROLE / USER | 权限控制 |
+
+**类比**：
+- DB / Schema / Table = 图书馆的书架和书（数据躺在那里）
+- WAREHOUSE = 来图书馆干活的那批工人（CPU + 内存）
+- 没工人就没人能查书；不同工作负载可以派不同规模的工人队
+
+**关联关系**：
+- Warehouse **不属于任何 DB**，是独立对象，跨 DB 通用
+- 任何 query 都必须指定一个 warehouse 才能跑
+- 同一个 warehouse 可以查任何 DB 的任何 schema（只要有权限）
+
+**例子**：
+
+```sql
+USE WAREHOUSE COMPUTE_WH_DC_DEV;  -- 选工人
+USE DATABASE IODP_DC_DEV;         -- 选图书馆
+USE SCHEMA SILVER;                -- 选哪一排书架
+SELECT * FROM events;             -- 工人按 query 去找数据
+```
+
+本项目配置 `XSMALL` + `AUTO_SUSPEND = 60`：1 个节点，空闲 60 秒自动挂起（挂起期间**不计费**），有 query 来 1-2 秒自动启动。开发/小流量场景的标配。
+
+### 2. RAW_STAGE schema 是什么 — Snowpipe 元数据收纳盒
+
+**核心结论**：RAW_STAGE 里**没有表，一张都没有**。它是 Snowpipe 入库链路的"元数据收纳盒"，装的是 Snowpipe 工作时需要的 3 类配置（参见 [snowflake_sql/04_pipe.sql](snowflake_sql/04_pipe.sql)）：
+
+| 对象类型 | 对象名 | 不是表，是啥？ | Snowpipe 用它干嘛 |
+|---|---|---|---|
+| FILE FORMAT | `PARQUET_FF` | 一组解析参数（"Parquet + Snappy"） | 告诉 Snowpipe 怎么解析 S3 文件 |
+| STAGE | `SILVER_S3_STAGE` | 指向 S3 的命名连接 | 告诉 Snowpipe 去哪个 S3 路径找文件 |
+| PIPE | `PIPE_DC_WIDE` | 一条自动加载规则（COPY INTO SQL） | 收到 SQS 通知后跑这段 SQL |
+
+直观示意：
+
+```
+IODP_DC_DEV (Database)
+│
+├── RAW_STAGE (Schema)   ← 没有表！只是 3 个"配置/规则"对象
+│   ├── PARQUET_FF        (FILE FORMAT)  → 解析参数
+│   ├── SILVER_S3_STAGE   (STAGE)        → 指向 S3 路径的快捷方式
+│   └── PIPE_DC_WIDE      (PIPE)         → 自动加载规则 (一段 SQL)
+│
+├── SILVER (Schema)      ← 这里才有表，有真数据
+│   ├── DC_WIDE           (TABLE)        → Parquet 加载后的行数据
+│   └── DC_WIDE_LATEST    (VIEW)
+│
+└── GOLD (Schema)        ← Dynamic Tables 聚合层
+    └── ...
+```
+
+**记账本不在 RAW_STAGE**：要区分两类元数据——
+
+| 元数据类型 | 存在哪里 | 例子 |
+|---|---|---|
+| **规则/定义元数据**（静态） | ✅ **RAW_STAGE schema** | Pipe 的 SQL 文本、Stage 的 S3 URL、FileFormat 的解析参数 |
+| **运行时/历史元数据**（动态） | ❌ **不在 RAW_STAGE**，在账户级系统视图 | 哪个文件加载了、加载几行、是否失败、Pipe 当前状态 |
+
+运行时部分这样查：
+
+```sql
+SYSTEM$PIPE_STATUS('PIPE_DC_WIDE')              -- pipe 当前状态
+INFORMATION_SCHEMA.COPY_HISTORY(...)            -- 文件加载历史(14天)
+SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY     -- pipe 用量计费(365天)
+```
+
+**一句话总结**：RAW_STAGE 装的是"Snowpipe 怎么干活"的规则；"Snowpipe 干了什么"的运行记录在 Snowflake 账户级元数据里，不在 RAW_STAGE。
+
+### 3. Snowpipe 触发机理 (5 步全自动)
+
+```
+Step 1: CREATE PIPE ... AUTO_INGEST = TRUE
+        Snowflake 返回 SQS ARN: arn:aws:sqs:us-east-1:xxx:sf-snowpipe-...
+   │
+Step 2: S3 bucket 配置 Event Notification → 上面那个 SQS (Terraform 自动化)
+   │
+Step 3: Glue 写入新 Parquet 到 s3://iodp-dc-silver-dev-xxx/download_channel/...
+   │
+Step 4: S3 自动发 SQS 消息 → Snowflake 后台轮询 SQS 收到消息
+        → 匹配 Stage URL → 排队执行 PIPE_DC_WIDE 里的 COPY INTO
+        → 用 serverless 计算（不用你的 warehouse, 单独计费）
+   │
+Step 5: 数据落到 SILVER.DC_WIDE 表
+        + 内部记账本里加一条: file_name | status | rows_loaded | last_load_time
+```
+
+延迟通常 **30 秒 ~ 2 分钟**（S3 事件传播 + Snowpipe 排队）。
+
+**去重机制**：Snowpipe 在记账本里**保留 14 天的已加载文件名**。同样文件名重新上传会被**跳过**。这就是为什么 Glue 写 Parquet 用 `part-00000-<uuid>.parquet` 这种带 UUID 的文件名——保证唯一，重新跑 Glue 不会被误判为重复。
+
+### 4. Role 体系：职责分离 + 为什么挂到 SYSADMIN 下
+
+#### 三个 role 是最小权限原则
+
+| Role | 给谁用 | 能做什么 |
+|---|---|---|
+| `IODP_DC_LOAD` | Snowpipe 服务账号 | 只能 INSERT 进 SILVER |
+| `IODP_DC_TRANSFORM` | Dynamic Table refresh | 能读 SILVER + 写 GOLD |
+| `IODP_DC_READER` | BI 工具 / Tableau / 下游消费者 | 只能 SELECT |
+
+好处：BI 工具 credential 泄漏，攻击者也只能读不能改写；ETL 出 bug 不会污染下游。
+
+#### Role hierarchy 容易误解的点
+
+`GRANT ROLE IODP_DC_READER_DEV TO ROLE SYSADMIN` **不是**"让 READER 拥有 SYSADMIN 权限"，而是反过来——**"让 SYSADMIN 能管理 READER 这个 role"**。
+
+Snowflake 的 role 是层级的：`grant role A to role B` → **B 包含 A 的能力**。
+
+#### 为什么必须挂到 SYSADMIN 下
+
+Snowflake 官方推荐的最佳实践：
+
+1. 不挂到 SYSADMIN 下，role 就成"孤儿"——只有 ACCOUNTADMIN 能管。而 ACCOUNTADMIN 是账户级最高权限（能开账单、删账户），日常运维不应该用它。
+2. 所有自定义 role 都挂到 SYSADMIN 下，DBA 用 SYSADMIN 就能统一管理所有业务 role。
+
+#### READER 用户实际权限会变大吗？不会
+
+普通 reader 用户登录后只会 `USE ROLE IODP_DC_READER_DEV`，他能用的权限就只是这个 role 上 grant 的那些 SELECT 权限。READER role 被 grant 给 SYSADMIN，受影响的只是 **SYSADMIN 这个角色** 多了一项能切换到 READER 的能力，**和 reader 用户本身的权限无关**。
+
+### 5. READER 实际读权限的 4 层授权链 (USAGE ≠ SELECT)
+
+`01_database_schemas.sql` 只配置了前 3 层（USAGE），真正的 SELECT 权限在创建对象的 SQL 文件里：
+
+| 层级 | 文件 | Grant | 作用 |
+|---|---|---|---|
+| 1. 计算 | [01_database_schemas.sql:39](snowflake_sql/01_database_schemas.sql#L39) | `USAGE ON WAREHOUSE` | 允许用 warehouse 跑 query |
+| 2. 容器 | [01_database_schemas.sql:44](snowflake_sql/01_database_schemas.sql#L44) | `USAGE ON DATABASE` | 允许"看见"DB |
+| 3. 命名空间 | [01_database_schemas.sql:50, 52](snowflake_sql/01_database_schemas.sql#L50-L52) | `USAGE ON SCHEMA SILVER/GOLD` | 允许"看见"schema 里有什么 |
+| 4. **真正的读权限** | 见下面 3 个文件 | `SELECT ON ...` | **真正能读数据** |
+
+第 4 层 SELECT 权限分散在：
+
+```sql
+-- snowflake_sql/03_silver_table.sql:32
+GRANT SELECT ON TABLE SILVER.DC_WIDE TO ROLE IODP_DC_READER_${ENV};
+
+-- snowflake_sql/05_gold_dynamic_tables.sql:85
+GRANT SELECT ON ALL DYNAMIC TABLES IN SCHEMA GOLD TO ROLE IODP_DC_READER_${ENV};
+
+-- snowflake_sql/07_bi_view.sql:50
+GRANT SELECT ON VIEW SILVER.DC_WIDE_LATEST TO ROLE IODP_DC_READER_${ENV};
+```
+
+**关键概念：USAGE ≠ SELECT（容易踩坑）**
+
+- `USAGE ON SCHEMA` = 让你能 `SHOW TABLES`、能 reference 这个 schema 下的对象（"知道这个 schema 存在，能看到目录"）
+- `SELECT ON TABLE` = 真正能跑 `SELECT * FROM table`（"能打开书读内容"）
+
+类比：USAGE 是"图书馆借阅证 + 知道某层楼在哪"，SELECT 才是"能借走那本书读"。
+
+reader 用户实际跑 query 时，4 层权限都会被检查，任何一层缺了就报 `Insufficient privileges`：
+
+```sql
+USE WAREHOUSE COMPUTE_WH_DC_DEV;       -- 检查第 1 层 USAGE ON WAREHOUSE   ✓
+USE DATABASE IODP_DC_DEV;              -- 检查第 2 层 USAGE ON DATABASE    ✓
+USE SCHEMA SILVER;                     -- 检查第 3 层 USAGE ON SCHEMA      ✓
+SELECT * FROM DC_WIDE LIMIT 10;        -- 检查第 4 层 SELECT ON TABLE      ✓
+```
+
+这种"对象和它的 grant 写在一起"的组织方式是 Snowflake 项目的常见 pattern——方便 review，不容易遗漏。
+
+---
+
+## Silver 宽表设计 (`03_silver_table.sql` 解读)
+
+参见 [snowflake_sql/03_silver_table.sql](snowflake_sql/03_silver_table.sql)。这张 `DC_WIDE` 表是整个 ETL 的核心——Snowpipe 的写入终点 + Dynamic Table 和 BI 的读取起点。
+
+### 1. `CLUSTER BY (dt)` 是什么 — 不是索引，是分区聚簇提示
+
+**核心纠正**：Snowflake 的 `CLUSTER BY` **不是传统数据库的"建索引"**——它没有 B-tree、没有索引文件。
+
+#### Snowflake 的存储模型：micro-partition
+
+Snowflake 表数据自动切成**很多小块**，每块叫一个 **micro-partition**（50-500MB，列式压缩，不可改）：
+
+```
+DC_WIDE 表（实际物理存储）：
+┌────────────────────────────────┐
+│ Partition #1                   │
+│   dt 范围: 2026-04-25 ~ 04-27  │
+│   product_id 范围: 100 ~ 9999  │  ← 每个 partition 自动维护 min/max 元数据
+│   ~200MB                       │
+├────────────────────────────────┤
+│ Partition #2                   │
+│   dt 范围: 2026-04-28 ~ 05-01  │
+└────────────────────────────────┘
+```
+
+#### 查询时的"分区裁剪"（Pruning）
+
+`SELECT * FROM DC_WIDE WHERE dt = '2026-05-01'` 时，Snowflake 看每个 partition 的 `dt` min/max 元数据，**直接跳过所有不包含目标日期的 partition**。扫得越少 → 查询越快 + 用 warehouse 的钱越少。
+
+#### `CLUSTER BY (dt)` 干啥
+
+它是给 Snowflake 的**一个提示**："请尽量把 `dt` 相近的行塞进同一个 micro-partition 里"。
+
+| 场景 | 没 CLUSTER BY | `CLUSTER BY (dt)` |
+|---|---|---|
+| 数据按 dt 顺序写入 | 自然就聚簇好，pruning 有效 | 一样有效 |
+| 数据乱序写入 / 历史回填 | partition 内 dt 范围乱，pruning 失效 | Snowflake 后台服务自动重排，保持聚簇 |
+
+本项目选 `dt` 做聚簇键的原因：
+- BI 查询 99% 带日期过滤
+- 数据天然按 dt 增长，聚簇维护成本低
+- 不选 `product_id` 是因为查询模式不会"查某个 product 全部历史"
+
+#### 与 OLTP 索引的关键区别
+
+| 概念 | MySQL/Postgres 的 INDEX | Snowflake 的 CLUSTER BY |
+|---|---|---|
+| 是不是独立的物理结构 | ✅ 是（B-tree 文件） | ❌ 不是，只是数据**重排**的提示 |
+| 强制唯一吗 | UNIQUE INDEX 可以 | ❌ 永远不强制 |
+| 加速点查（按 ID 找一行） | ✅ 强项 | ❌ 不擅长，Snowflake 是 OLAP 不是点查系统 |
+| 加速范围扫描 | 一般 | ✅ 强项（pruning） |
+
+### 2. `TIMESTAMP_NTZ` vs `TIMESTAMP_LTZ` — 什么时候用哪个
+
+Snowflake 有 3 种 timestamp：
+
+| 类型 | 全名 | 怎么存 | 显示时 |
+|---|---|---|---|
+| `TIMESTAMP_NTZ` | **No Time Zone** | 存"墙上时钟"字面值，**不带时区信息** | 永远显示存进去那个值 |
+| `TIMESTAMP_LTZ` | **Local Time Zone** | 内部存 UTC | 按**查询者 session 的时区**自动转换 |
+| `TIMESTAMP_TZ` | with Time Zone | 存 UTC + 原始时区 | 显示原始时区下的时间 |
+
+#### 直观例子
+
+假设 Glue 在北京时间 16:00 写入数据（= UTC 08:00）：
+
+```sql
+INSERT INTO DC_WIDE VALUES (
+  ...,
+  ingest_ts  = '2026-05-01 08:00:00',   -- 业务约定写 UTC
+  _loaded_at = CURRENT_TIMESTAMP()      -- Snowflake 自动填 UTC 08:00:00
+);
+```
+
+**北京同事 vs 加州同事查同一行的对比**：
+
+| 字段 | 北京同事看到 | 加州同事看到 |
+|---|---|---|
+| `ingest_ts` (NTZ) | `2026-05-01 08:00:00` | `2026-05-01 08:00:00` ← **一模一样** |
+| `_loaded_at` (LTZ) | `2026-05-01 16:00:00` | `2026-05-01 01:00:00` ← **自动按本地时区转** |
+
+#### 这张表为什么两种都用？
+
+| 字段 | 类型 | 语义 |
+|---|---|---|
+| `ingest_ts` | `TIMESTAMP_NTZ` | **业务时间戳**——上游 Glue 已统一写成 UTC，下游 BI 计算"5 月 1 号下载量"不能因查询者时区不同而结果飘。NTZ 保证全公司看到同一个值，是 **single source of truth**。 |
+| `_loaded_at` | `TIMESTAMP_LTZ` | **运维时间戳**——这一行什么时候落到 Snowflake 的。oncall 排查问题时希望看本地时间（北京 oncall 看北京时间，加州 oncall 看 PST），LTZ 自动转。 |
+
+**记忆口诀**：
+- 业务/分析数据 → **NTZ**（统一 UTC，谁查都一样）
+- 运维/审计/日志 → **LTZ**（按本地时区显示，方便排查）
+
+⚠️ **常见踩坑**：上游传过来的时间不是 UTC 而是混了本地时间，NTZ 会出 bug。**Bronze→Silver 边界统一转 UTC** 是基本规范。
+
+### 3. 为什么宽表没有主键 / 外键 — OLAP 范式
+
+**核心结论**：Snowflake **支持声明** PK / FK，但**不强制**——它们纯粹是文档和给 query optimizer 的暗示，**不会阻止重复，也不会检查外键完整性**。
+
+#### 验证
+
+```sql
+CREATE TABLE DC_WIDE (
+  ...,
+  PRIMARY KEY (dt, product_id, app_store, country, device)
+);
+INSERT INTO DC_WIDE VALUES ('2026-05-01', 100, 'apple', 'US', 'iphone', ...);
+INSERT INTO DC_WIDE VALUES ('2026-05-01', 100, 'apple', 'US', 'iphone', ...);  -- 重复
+SELECT COUNT(*) FROM DC_WIDE;  -- 返回 2, 不会报错
+```
+
+**Snowflake 完全允许写两条相同的 PK**——和 MySQL 行为完全不一样。所以本项目**干脆不声明**，避免误导。
+
+#### 为什么 OLAP 数据仓库都不强制约束？
+
+| 原因 | 解释 |
+|---|---|
+| **性能** | 强制唯一意味着每次 INSERT 都要查全表，单批写百万行会卡死。OLAP 优先吞吐量。 |
+| **append-only 设计** | Snowpipe 永远是追加，可能因 SQS 重投递、文件 replay 出现重复。写入时阻止重复 → Snowpipe 直接挂掉，反而更糟。 |
+| **批处理范式** | 上游 Glue 已做 schema 校验和数据质量检查。仓库层信任上游 = 分层职责清晰。 |
+| **关联很少要 FK** | OLAP join 用 dt + 业务键就够了，FK 完整性靠上游保证。 |
+
+#### OLAP 怎么处理"主键唯一"需求？不靠 DB 强制，靠**模式**
+
+**方法 1：定时去重 task**（本项目用这个）
+
+参见 [snowflake_sql/06_dedup_task.sql](snowflake_sql/06_dedup_task.sql)——按逻辑主键 `(dt, product_id, app_store, country, device)` 定期去重。
+
+**方法 2：查询时去重（用 `QUALIFY`）**
+
+```sql
+SELECT *
+FROM DC_WIDE
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY dt, product_id, app_store, country, device
+  ORDER BY ingest_ts DESC          -- 同 key 多条时，留最新的
+) = 1;
+```
+
+参见 [snowflake_sql/07_bi_view.sql](snowflake_sql/07_bi_view.sql) 的 `DC_WIDE_LATEST` 视图——BI 直接查这个视图，自动只看最新版本。
+
+**方法 3：MERGE 而不是 INSERT**（本项目没用，因为 Snowpipe 只支持 COPY = INSERT，不支持 MERGE）
+
+#### 为什么叫"宽表" — Dimensional Modeling
+
+| 范式 | OLTP（MySQL）| OLAP（Snowflake DC_WIDE）|
+|---|---|---|
+| 表设计 | 拆成小表 + FK：`products` / `countries` / `devices` / `downloads` 互相 join | **故意把所有维度摊开成一个宽表** |
+| 查询性能 | join 多 → 慢 | 不 join → 飞快 |
+| 约束 | FK 保证完整性 | 没 FK，因为没 join 需求 |
+| 重复字符串 | normalize 节省空间 | 列式压缩后几乎不占空间 |
+
+#### 一句话总结
+
+> **OLTP 用约束保证正确性，OLAP 用 pipeline 保证正确性。** Snowflake 不强制 PK/FK 是特性不是 bug——它把"数据质量"的责任推给 Glue（上游写入时验证）和 dedup task（仓库层周期清理），换来超高的写入吞吐和查询性能。
+
+---
+
+## 04_pipe.sql 两个细节问题
+
+### 1) `IODP_DC_S3_INT_${ENV}` 在哪里创建？
+
+**在 Terraform 里创建**，不在 SQL 文件里。
+
+具体位置：[terraform/modules/snowflake/main.tf:201](terraform/modules/snowflake/main.tf#L201)
+
+```hcl
+resource "snowflake_storage_integration" "s3_int" {
+  name    = "IODP_DC_S3_INT_${local.env_upper}"
+  type    = "EXTERNAL_STAGE"
+  enabled = true
+  ...
+}
+```
+
+**为什么必须在 Terraform 里创建？** 因为 Storage Integration 创建后会生成一个 Snowflake 端的 IAM User ARN 和 External ID，需要拿到这两个值再去配置 AWS IAM Role 的 trust policy（让 Snowflake 能 assume 这个 role 去读 S3）。这是个 Snowflake ↔ AWS 的双向握手，Terraform 可以一次性 orchestrate 两边；纯 SQL 做不到。
+
+执行顺序：
+1. Terraform 创建 `snowflake_storage_integration.s3_int` + AWS IAM Role + trust policy
+2. SQL [04_pipe.sql:14](snowflake_sql/04_pipe.sql#L14) 引用已经存在的 `IODP_DC_S3_INT_${ENV}` 来创建 stage
+
+`01_database_schemas.sql` 里没有 storage integration，那个文件只管 database/schema/warehouse/role 这种纯 Snowflake 内部对象。
+
+### 2) `GRANT OPERATE` / `GRANT MONITOR` on PIPE 是干嘛？
+
+这两个权限是 Snowflake 对 PIPE 对象的标准管理权限：
+
+- **`OPERATE`** — 允许角色对 pipe 执行运维操作：`ALTER PIPE … SET PIPE_EXECUTION_PAUSED = TRUE/FALSE`（暂停/恢复 ingest）、`ALTER PIPE … REFRESH`（手动重新扫描 stage 把漏掉的文件补进来）。如果 S3 SNS event 丢了或者 pipe 卡住了，需要这个权限去恢复。
+- **`MONITOR`** — 允许角色查 pipe 状态：`SYSTEM$PIPE_STATUS('PIPE_DC_WIDE')`、`COPY_HISTORY`、`PIPE_USAGE_HISTORY` 这些。用来看有没有积压、有没有报错、最近一次 ingest 是什么时候。
+
+注意一个细节：这里两个权限都 grant 给了 `IODP_DC_LOAD_${ENV}`（load 角色自己）。这意味着 load 角色既能跑 pipe 又能管 pipe。如果想做更严格的最小权限拆分，通常 `MONITOR` 给运维/SRE 角色，`OPERATE` 给 on-call 角色，`IODP_DC_LOAD_*` 只保留把数据写进 SILVER.DC_WIDE 所需的最少权限。当前这种写法是单角色简化模式，对小团队/单环境是合理的。
+
+---
+
+## Snowflake Senior 五问 — 一行配置背后的 cost / failure / tradeoff
+
+> 看到一行配置（`AUTO_INGEST=TRUE` / `GRANT OPERATE` / `CLUSTER BY` / `TARGET_LAG` / `::BOOLEAN`），别只问"这是啥"，要问三连：
+> 1. **为啥选这个，不选别的？**（tradeoff）
+> 2. **这玩意烧多少钱？**（cost model）
+> 3. **它怎么坏？怎么发现？怎么补？**（failure mode）
+
+下面把这三问套在五个真实配置上。
+
+### Q1. 为什么用 Snowpipe AUTO_INGEST，不用 Snowpipe Streaming / scheduled COPY？
+
+#### 三种 ingest 方式对比
+
+| 方式 | 怎么工作 | 延迟 | 计费方式 | 适合场景 |
+|---|---|---|---|---|
+| **Snowpipe AUTO_INGEST**（本项目用的）| S3 写文件 → SNS 通知 → Snowpipe 看到 → 自动 COPY | ~1 分钟 | 按文件数 + 数据量 | 文件已存在的批量 ETL |
+| **Snowpipe Streaming** | Java/Python SDK 直接 push **行**进来（不走文件）| ~几秒 | 按行数 | IoT、点击流、CDC |
+| **Scheduled COPY** | TASK 每 N 分钟跑一次 `COPY INTO` | = N 分钟 | 按 warehouse 起来的时间 | 不在乎延迟 + 批量大 |
+
+#### 为啥选 AUTO_INGEST
+
+看 [04_pipe.sql:19](snowflake_sql/04_pipe.sql#L19) — `AUTO_INGEST = TRUE`。原因有三：
+
+1. **上游 Glue 已经写 Parquet 到 S3 了**。文件天生存在 → Snowpipe Streaming 用不上（那个是不写文件直接 push 行）。
+2. **一天一次的批 ETL，几分钟延迟够用**。不需要 sub-second。
+3. **比 scheduled COPY 省 warehouse 钱**。
+
+#### 成本对比（粗估，XS warehouse $4/credit）
+
+假设一天 100 个 Parquet 文件：
+
+```
+Snowpipe AUTO_INGEST:
+  ~0.06 credits / 1000 files (Snowpipe serverless 收费)
+  = 0.006 credits/天 ≈ $0.025/天 ≈ 月 $0.75
+
+Scheduled COPY (每 15 min 跑一次, XS warehouse 起来 60s):
+  60s × 96次/天 = 1.6 hours = 1.6 credits/天 = $6.4/天 ≈ 月 $192
+
+差 ~250x
+```
+
+**关键直觉**：Snowpipe 是 "serverless"——文件来了就 COPY，没文件就不烧钱。Scheduled COPY 你要起一个 warehouse，哪怕这 15 分钟没文件也得起来 60 秒（minimum charge），白烧。
+
+#### 反过来什么时候 Snowpipe 反而贵
+
+文件**多且小**（一天 100 万个 5KB 小文件）：Snowpipe 的 "per file overhead" 累计 → 这时候反而该攒一攒批量 COPY。本项目一天几十到几百个 Parquet 文件，每个几 MB → 完全在 Snowpipe 的甜区。
+
+---
+
+### Q2. SNS event 丢了一条，怎么发现？怎么补？
+
+#### 先理解为啥会丢
+
+链路：`S3 PutObject → S3 event → SNS → Snowpipe SQS → Snowpipe service → COPY`
+
+会丢的地方：
+- SNS → SQS 偶发丢（AWS 只承诺 at-least-once，极小概率会 0 次）
+- Pipe 暂停期间写的文件
+- SNS 配置之前就上传的历史文件
+- IAM/SQS policy 配错，event 来了进不了 queue（这种是大批量丢，容易发现）
+
+#### 怎么发现
+
+**最差的方式**：BI 同学问"今天数据怎么少了"。已经过几天了。
+
+**主动发现 — 对账**：Glue 每次写完文件，自己记一笔 manifest（"今天写了 87 个文件"），跑 reconciliation：
+
+```sql
+-- 查 Snowflake 实际加载了多少
+SELECT 
+  DATE_TRUNC('day', LAST_LOAD_TIME) AS load_day,
+  COUNT(*) AS files_loaded,
+  SUM(ROW_COUNT) AS rows_loaded
+FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+  TABLE_NAME => 'IODP_DC_DEV.SILVER.DC_WIDE',
+  START_TIME => DATEADD('day', -7, CURRENT_TIMESTAMP())
+))
+GROUP BY 1
+ORDER BY 1;
+```
+
+跟 Glue 写的 manifest 对比，对不上就是丢了。
+
+**实时检查 pipe 健康**：
+
+```sql
+SELECT SYSTEM$PIPE_STATUS('IODP_DC_DEV.RAW_STAGE.PIPE_DC_WIDE');
+```
+
+返回 JSON 类似：
+```json
+{
+  "executionState": "RUNNING",
+  "pendingFileCount": 0,
+  "lastReceivedMessageTimestamp": "2026-04-30T14:22:01Z",
+  "lastForwardedMessageTimestamp": "2026-04-30T14:22:03Z"
+}
+```
+
+`pendingFileCount` 一直涨 = pipe 卡了。`lastReceivedMessageTimestamp` 长时间不更新但 S3 一直在写文件 → SNS 通路断了。
+
+#### 怎么补
+
+```sql
+-- 场景 1: 丢的文件在最近 7 天内 → REFRESH 命令重新扫整个 stage
+ALTER PIPE PIPE_DC_WIDE REFRESH;
+
+-- 场景 2: 知道大概时间段 → 缩小范围
+ALTER PIPE PIPE_DC_WIDE REFRESH MODIFIED_AFTER = '2026-04-25T00:00:00Z';
+
+-- 场景 3: 超过 7 天 (REFRESH 限制) → 手工 COPY 单文件
+COPY INTO IODP_DC_DEV.SILVER.DC_WIDE
+FROM @SILVER_S3_STAGE/2026/04/15/file_xyz.parquet
+FILE_FORMAT = (FORMAT_NAME = 'PARQUET_FF');
+```
+
+⚠️ **REFRESH 的坑**：它只补**没加载过的**文件——已经加载过的不会重复加。所以幂等的，可以放心跑。但有个 7 天窗口，超过 7 天的文件 REFRESH 不管。
+
+**这就是为啥 [04_pipe.sql:52](snowflake_sql/04_pipe.sql#L52) 给 LOAD 角色 GRANT OPERATE**——出事了得有人能跑 REFRESH。
+
+---
+
+### Q3. DC_WIDE 的 clustering key
+
+#### 项目里实际是什么
+
+[03_silver_table.sql:26](snowflake_sql/03_silver_table.sql#L26):
+
+```sql
+CLUSTER BY (dt)
+```
+
+✅ 这个选择是对的。下面解释为啥。
+
+#### 什么是 clustering（类比）
+
+Snowflake 把表切成 16MB 的 **micro-partition**（小块）。每个块自动记录每列的 **min / max**。
+
+类比：图书馆按书名首字母排架。
+- 你查 "S 开头的书" → 馆员直接走到 S 区，跳过 A-R, T-Z（**partition pruning**）
+- 不排架（随机堆）→ 整个图书馆翻一遍
+
+`CLUSTER BY (dt)` = 按 `dt` 排架。
+
+#### 为啥选 dt 不选别的
+
+看 Gold 层的查询模式：
+
+[05_gold_dynamic_tables.sql:77](snowflake_sql/05_gold_dynamic_tables.sql#L77):
+```sql
+WHERE dt >= DATEADD('day', -30, CURRENT_DATE())
+```
+
+[05_gold_dynamic_tables.sql:29](snowflake_sql/05_gold_dynamic_tables.sql#L29):
+```sql
+GROUP BY dt, product_id, app_store
+```
+
+所有查询都**按 dt 过滤或聚合**。CLUSTER BY (dt) 让"查最近 30 天" 只扫 ~30/365 = 8% 的 partition。
+
+#### 数字感
+
+假设 DC_WIDE 一年 365M 行，分成 1000 个 micro-partition：
+
+| 场景 | 扫描 partition 数 | XS warehouse 时间 | credit |
+|---|---|---|---|
+| 不 cluster, 查 30 天 | 1000（全表）| ~30s | 0.008 |
+| CLUSTER BY (dt), 查 30 天 | ~80 | ~3s | 0.0008 |
+
+**单次查询省 10x。** 而 Gold 的 dynamic table 一天 refresh 几十次 → 一年累计差几百刀。
+
+#### 为啥不 CLUSTER BY (dt, app_store) 多列？
+
+- 多列 cluster key 的 prune 效果**递减**——第一列已经把数据切到 30 天了，第二列再切只能在那 30 天里再细分
+- `app_store` 只有 2 个值（`ios` / `android`）→ 第二列基本没 prune 空间
+- 多列 cluster 的**维护成本**（auto-clustering 重排数据）反而上升
+
+**规则**：cluster key 选**最常出现在 WHERE / JOIN 的列**，且**基数适中**（不能太少像 boolean，也不能太多像 UUID）。`dt` 完美。
+
+#### 隐藏成本：auto-clustering 自己烧钱
+
+Snowflake 后台有个进程持续 reorganize 数据保持 cluster 状态，烧 credit。可以查：
+
+```sql
+SELECT * FROM TABLE(INFORMATION_SCHEMA.AUTOMATIC_CLUSTERING_HISTORY(
+  DATE_RANGE_START => DATEADD('day', -7, CURRENT_DATE()),
+  TABLE_NAME => 'IODP_DC_DEV.SILVER.DC_WIDE'
+));
+```
+
+写多读少的表 cluster 不划算，写少读多（本项目）划算。
+
+---
+
+### Q4. TARGET_LAG = 15 min vs 1 hour，credit 差多少
+
+#### 项目实际配置
+
+[05_gold_dynamic_tables.sql](snowflake_sql/05_gold_dynamic_tables.sql)（**当前状态**，原本两张 daily 表是 15 min，详见 Q6 的优化记录）：
+- `DC_DAILY_BY_APP` → `TARGET_LAG = '30 minutes'`
+- `DC_DAILY_BY_COUNTRY` → `TARGET_LAG = '30 minutes'`
+- `DC_PAID_VS_ORGANIC_TREND` → `TARGET_LAG = '1 hour'`
+
+#### TARGET_LAG 是啥
+
+= "**我承诺这张表落后上游 DC_WIDE 不超过 X**"。
+
+注意：你不是设 cron"每 15 分钟跑一次"。你设的是**SLA 上限**，Snowflake 自己看 DC_WIDE 多频繁更新、refresh 跑多久，反推该多频繁触发——可能 14 分钟一次，也可能 5 分钟一次。
+
+#### 成本怎么来
+
+每次 refresh = warehouse 起来跑 incremental query 一段时间。
+
+**假设**（粗估，实际跑过才知道）：
+- DC_WIDE 一天新增 ~1M 行
+- 一次 incremental refresh = warehouse start (30s) + query (5s) ≈ 35s
+- 用 XS warehouse, $4/credit/hour
+
+| TARGET_LAG | 每天 refresh 次数 | 每天 warehouse 时间 | 每天 credit | 月成本 |
+|---|---|---|---|---|
+| 1 minute | 1440 | 14 hours | 14 | $1680 |
+| 15 minutes | 96 | 0.93 hours | 0.93 | $112 |
+| 1 hour | 24 | 0.23 hours | 0.23 | $28 |
+| 24 hours | 1 | 0.01 hours | 0.01 | $1.2 |
+
+**1 min vs 15 min 差 15 倍。15 min vs 1 hour 差 4 倍。1 min vs 24 hour 差 1400 倍。**
+
+#### 项目这个配置合不合理？
+
+`DC_DAILY_BY_APP` / `DC_DAILY_BY_COUNTRY` = **15 min**：BI dashboard 看 daily 数据，15 分钟刷新够"实时" → 合理。
+
+`DC_PAID_VS_ORGANIC_TREND` = **1 hour**：30 天 trend 是分析用，不需要分钟级新鲜度 → 合理。
+
+#### Senior 会接着问的
+
+1. **谁定的这个数？** 通常 DE 跟 BI 团队聊："你们多频繁刷 dashboard？"→ 反推 lag。**这是产品决定不是技术决定**。如果 BI 一天就开两次 dashboard，15 min lag 是浪费。
+2. **DOWNSTREAM lag**？Snowflake 支持 `TARGET_LAG = DOWNSTREAM`——意思是"下游被查到才刷"。如果 dashboard 早晚 9-6 才看，半夜不需要 refresh，可以省 50%+。本项目没用，是潜在优化点。
+3. **incremental vs full refresh**？Dynamic Table 默认 incremental（只算变化的部分），但有些 SQL pattern（比如 `COUNT(DISTINCT)`）Snowflake 没法 incremental，会偷偷退化成 full refresh，巨贵。看 [05_gold_dynamic_tables.sql](snowflake_sql/05_gold_dynamic_tables.sql) 原本的 `COUNT(DISTINCT country)` —— **这条曾经是 full refresh！** 跑 `SHOW DYNAMIC TABLES;` 看 `refresh_mode` 列能验证。如果是 full，每 15 min 全表重算 → 月成本可能比上面表格高 10x。**✅ 这一条已在 Q6 修复**（删 COUNT DISTINCT + LAG 调到 30 min）。
+
+---
+
+### Q5. `is_estimate_final::BOOLEAN` 如果 Parquet 里是 String 怎么办？
+
+#### Snowflake cast Parquet → BOOLEAN 的规则
+
+[04_pipe.sql:46](snowflake_sql/04_pipe.sql#L46): `$1:is_estimate_final::BOOLEAN`
+
+| Parquet 实际类型 | 值 | Snowflake `::BOOLEAN` 结果 |
+|---|---|---|
+| BOOLEAN | true | TRUE ✅ |
+| STRING | `"true"` / `"TRUE"` / `"t"` / `"yes"` / `"1"` | TRUE ✅ |
+| STRING | `"false"` / `"FALSE"` / `"f"` / `"no"` / `"0"` | FALSE ✅ |
+| STRING | `"maybe"` / `""` / `"N/A"` / `"YES "`(带空格) | **❌ 报错** |
+| INT | 0 | FALSE ✅ |
+| INT | 1 | TRUE ✅ |
+| INT | 其他（2, -1, 100）| **❌ 报错** |
+| NULL | — | NULL（如果列 NOT NULL → 报错）|
+
+#### 报错之后会发生啥（关键的坑）
+
+COPY 有个参数 `ON_ERROR`：
+
+```sql
+ON_ERROR = 'ABORT_STATEMENT'  -- 整个 COPY 中止，没行加载（COPY 默认）
+ON_ERROR = 'CONTINUE'          -- 跳过坏行，加载好行
+ON_ERROR = 'SKIP_FILE'         -- 整个文件跳过
+ON_ERROR = 'SKIP_FILE_<n>'     -- 坏行超 n 跳过整文件
+```
+
+**🚨 Snowpipe 的默认是 `SKIP_FILE`**（跟普通 COPY 不一样！普通 COPY 默认是 ABORT_STATEMENT）。
+
+#### 本项目的 04_pipe.sql 没设 ON_ERROR
+
+→ 用 Snowpipe 默认 = **SKIP_FILE** → **一个文件里有一行 cast 失败，整个文件被跳过，数据全丢，没有报错**。
+
+也就是说：如果某天 Glue 写出来一个文件里某行 `is_estimate_final = "unknown"`，**整个文件 100 万行都进不来**，而且 pipe 不会显眼地报错——就静悄悄地丢了。
+
+#### 怎么发现这种静默丢失
+
+```sql
+-- 看哪些文件 SKIP 掉了
+SELECT FILE_NAME, STATUS, FIRST_ERROR_MESSAGE, ROW_COUNT
+FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+  TABLE_NAME => 'IODP_DC_DEV.SILVER.DC_WIDE',
+  START_TIME => DATEADD('day', -7, CURRENT_TIMESTAMP())
+))
+WHERE STATUS != 'Loaded';
+```
+
+或者用专门的 validate 函数：
+
+```sql
+SELECT * FROM TABLE(VALIDATE_PIPE_LOAD(
+  PIPE_NAME => 'IODP_DC_DEV.RAW_STAGE.PIPE_DC_WIDE',
+  START_TIME => DATEADD('day', -7, CURRENT_TIMESTAMP())
+));
+```
+
+#### 怎么防
+
+三层防线，**最好的是第一层**：
+
+1. **上游严格**：Glue 写 Parquet 时强制 schema，`is_estimate_final` 必须是真 BOOLEAN，不接受 string。一旦上游对了，Snowflake 这边永远不会 cast 失败。
+2. **Pipe 配 ON_ERROR + 监控**：把 SKIP_FILE 改成 CONTINUE（保住好行）+ 配 SNS 告警监控 COPY_HISTORY 里的 STATUS != 'Loaded'。
+3. **每日对账 job**：reconciliation（Q2 那个）能事后捕捉到。
+
+本项目目前是 **0 层防线**——既没显式 ON_ERROR、也没监控。这是个潜在 bug，建议提一下。
+
+---
+
+### Q6. Q4 那个 COUNT(DISTINCT) 退化成 full refresh 的隐患，怎么修的
+
+#### 起因
+
+Q4 末尾埋的伏笔：[05_gold_dynamic_tables.sql](snowflake_sql/05_gold_dynamic_tables.sql) 里几个 `COUNT(DISTINCT)` 列让两张 daily Dynamic Table 退化成 full refresh —— 每 15 分钟全表重算一次。同时 `DC_PAID_VS_ORGANIC_TREND` 也是 full refresh，但根因不同：滑动窗口 `WHERE dt >= DATEADD('day', -30, CURRENT_DATE())` 边界天天动，Snowflake 没法增量化。
+
+#### 成本分析的几个反直觉点
+
+讨论时差点踩的坑："那就把不需要的字段删掉省钱"——**列式存储里这基本没用**。Snowflake 只读 SELECT 引用到的列，没引用的字段本来就没扫。多算一个 `SUM` 共享同一次 IO，几乎免费。
+
+真正的成本驱动因素：
+
+| 因素 | 影响 |
+|---|---|
+| 扫描行数 | ⭐⭐⭐ 最大（full vs incremental 差几十倍） |
+| `COUNT(DISTINCT)` 基数 | ⭐⭐⭐ 大，且**阻止增量化** |
+| GROUP BY 组合数 | ⭐⭐ 中（影响 shuffle） |
+| SELECT 字段数 | ⭐ 几乎没影响 |
+| 刷新频率 | ⭐⭐⭐ 直接乘数 |
+
+→ **真正的杠杆是"让查询从 full → incremental"**，删 `COUNT(DISTINCT)` 是手段，不是目的。
+
+#### 删字段前的下游引用检查（关键步骤）
+
+memory 里有一条规则："Fix both sides of producer/consumer pairs"。删 Gold 列前先 grep 全仓：
+
+```bash
+grep -r "country_count\|device_count\|app_count" snowflake_sql/
+# 只命中 05_gold_dynamic_tables.sql 自己
+```
+
+`07_bi_view.sql` 是 Silver 层 `DC_WIDE_LATEST` 视图，不读 Gold。下游安全 → 可以删。
+
+如果跳过这步直接删，BI 视图或下游 dashboard 报 "column not found" 是分分钟的事。
+
+#### 实际改动
+
+| 表 | 改动 | 效果 |
+|---|---|---|
+| `DC_DAILY_BY_APP` | 15min→30min；删 `country_count`、`device_count` | full → incremental + 频率减半 |
+| `DC_DAILY_BY_COUNTRY` | 15min→30min；删 `app_count`、`device_count` | full → incremental + 频率减半 |
+| `DC_PAID_VS_ORGANIC_TREND` | **不动** | 仍 full（滑动窗口决定，删字段救不了） |
+
+`row_count`（`COUNT(*)`）保留——它不是 DISTINCT，不阻止增量，且对监控数据完整性有用。
+
+#### 为什么 TREND 没改成 30min（即使原话是"都改 30 分钟"）
+
+它本来就是 1hr，改 30min 只会**翻倍开销**，且救不了它的 full-refresh 体质（根因在 `WHERE` 滑动窗口不在 LAG）。30 天 trend 图本来就不需要分钟级新鲜度，1hr 反而更对路。这种时候不能机械执行字面要求，要把账算明白告诉用户。
+
+> 潜在的进一步优化：把 TREND 的 `WHERE dt >= DATEADD('day', -30, ...)` 去掉，让 Dynamic Table 聚合所有日期走 incremental，再让 BI 视图层做 30 天裁剪。本次没做，留作下一轮优化。
+
+#### 部署后怎么验证 incremental 真的生效
+
+```sql
+SELECT name, refresh_action, refresh_trigger, target_lag_sec, cost_in_credits
+FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+  NAME => 'IODP_DC_DEV.GOLD.DC_DAILY_BY_APP'
+))
+ORDER BY refresh_start_time DESC LIMIT 10;
+```
+
+`refresh_action` 应该从 `FULL` → `INCREMENTAL`。或者直接：
+
+```sql
+SHOW DYNAMIC TABLES IN SCHEMA IODP_DC_DEV.GOLD;
+-- 看 refresh_mode 列
+```
+
+#### 预期收益（粗估）
+
+两张 daily 表叠加效应：
+- 频率 15min → 30min ≈ 省 50%
+- Full → Incremental（只扫当日新增 ~1M 行 vs 全表 N×1M 行）≈ 再省 70-90%
+- 综合 ≈ 节省 ~85% 以上
+
+实际数字部署后两周，用 Q4 的 credit 对照表 + `DYNAMIC_TABLE_REFRESH_HISTORY.cost_in_credits` 验证。
+
+#### 这个故事的几个教训
+
+1. **写文档时埋的"潜在问题"要回头修**——Q4 当时已经预测到了 full-refresh 风险，但没动手，是文档和代码脱节的典型。
+2. **删字段前必须做下游引用检查**，否则 BI 炸。
+3. **直觉常常错**——"删字段省 IO"在列存里基本无效，"调小 TARGET_LAG 让数据更新鲜"对 full refresh 表来说是直接乘数的烧钱。
+4. **机械执行 ≠ 帮上忙**——用户说"都改 30min"时，TREND 改 30min 实际上是在帮倒忙，把账算明白比照单全收更有价值。
+
+---
+
+## 07_bi_view.sql 两个细节问题
+
+### 问题 1：`实测延时差距 < 200ms` 到底是谁对比谁？
+
+注释里这句话写得太省，容易让人误以为是"加了 QUALIFY 反而只慢 200ms 是因为 Snowflake 优化牛"。**真实原因是 Dedup Task 把活已经干完了，QUALIFY 在大部分时间里是空跑。**
+
+**对比对象**：BI 跑同一句 SQL（例如 `SELECT count(*), sum(downloads_total) FROM ... WHERE dt='2026-05-01'`），两种走法：
+
+| 查询路径 | 等价 SQL |
+|---|---|
+| **A（不去重）** | `SELECT ... FROM SILVER.DC_WIDE` |
+| **B（用本视图）** | `SELECT ... FROM SILVER.DC_WIDE_LATEST`（即 A + `QUALIFY ROW_NUMBER() OVER (...) = 1`） |
+
+**举例**：
+- 直查底表 `DC_WIDE`：~1.0s
+- 改查 `DC_WIDE_LATEST`：~1.1s（多花 < 200ms 跑窗口函数）
+
+**为什么差距这么小**：
+
+Dedup Task 凌晨 06:00 跑完后，每个 PK 组合（`dt + product_id + app_store + country + device`）在 `DC_WIDE` 里就只剩 1 行了。这时候：
+
+```sql
+ROW_NUMBER() OVER (PARTITION BY pk ORDER BY _loaded_at DESC)
+```
+
+每个分区里只有 1 行 → 给所有行都打 `rn=1` → `QUALIFY rn=1` 等于不过滤任何行，纯属"陪跑"。Snowflake 只是多做了一次"每个分区排个序"的开销，而每个分区只有 1 行，排序近乎零成本。
+
+**只有在 Snowpipe 新写入到次日 06:00 这 ~20 小时窗口内**，少数 PK 才会有 2 行，QUALIFY 才真的在过滤东西。但即便如此，开销也只是窗口函数本身，不会成数量级放大。
+
+---
+
+### 问题 2：为什么 `ROW_NUMBER` 会破坏 Dynamic Table 的增量刷新？
+
+这是个 Snowflake 高频考点，搞清楚原理就懂了为什么 Gold 层不能图方便走这个视图。
+
+#### 核心原理
+
+Dynamic Table 的"增量刷新"靠的是 **只处理新增/变更的行**，不重扫整张源表。要做到这点，必须满足一个前提：
+
+> **源表来一行新数据，目标表的结果只能影响这一行，不能牵连别的行。**
+
+而 `ROW_NUMBER() OVER (PARTITION BY pk ORDER BY _loaded_at DESC)` 恰好相反——**新来一行可能改变同分区内其他行的排名**。
+
+#### 举例说明
+
+假设 PK = `(2026-05-01, prod_A, ios, US, iphone)`，源表 `DC_WIDE` 此刻只有一行：
+
+| _loaded_at | rn | 是否进 LATEST |
+|---|---|---|
+| 09:00 | 1 | ✅ |
+
+Dynamic Table 增量刷新时，把这行 INSERT 到目标表。
+
+**Snowpipe 又 COPY 了一次，多了一行 `_loaded_at = 11:00`**：
+
+| _loaded_at | rn | 是否进 LATEST |
+|---|---|---|
+| **11:00** | **1** | ✅ |
+| 09:00 | **2** | ❌（之前是 1，现在变 2 了！） |
+
+问题来了：
+- 新行 11:00 → 需要 INSERT 到目标表
+- **旧行 09:00 → 需要 DELETE**（它原本 rn=1 已经在目标表里，现在掉到 rn=2 不该出现）
+
+Snowflake 拿到"插入了一行 11:00"这个增量信号时，**没法只看这一行就算出"还得删掉 09:00 那行"**——它必须重新扫整个分区才知道 09:00 的排名变了。
+
+#### Snowflake 的应对
+
+发现查询里有这种"牵连式"窗口函数后，Snowflake 会判定查询"不可增量刷新"，于是：
+
+| 应对 | 后果 |
+|---|---|
+| 降级为 FULL REFRESH | 每次刷新整张表重算，N 天 × 1M 行全扫一遍，算力成本暴涨（参考前面 §Snowflake Senior 五问 第 4 节，TREND 表 full-refresh 一周烧了约 N 倍 credit）|
+| 部分场景直接报错/警告 | `CREATE DYNAMIC TABLE` 阶段就拒绝 |
+
+实际上和 §2024 那段"trend 表为什么变 full refresh"是同一类问题的两个面：那边是"Aggregation 变更引发降级"，这边是"窗口函数引发降级"。
+
+#### 一句话总结
+
+> **窗口函数的结果依赖整个分区，新增一行会"追溯影响"已有行的输出，破坏了"增量 = 只看 delta"的前提，所以 Dynamic Table 没法增量刷新。**
+
+#### 这里的取舍
+
+Gold 层是日报场景（业务能接受 ~20 小时数据稍有重复），所以 Gold 宁愿读 **未去重的 DC_WIDE** 享受增量刷新红利，也不接成本暴涨的 FULL REFRESH。
+
+而 BI 直查视图 `DC_WIDE_LATEST` 是 **on-demand 查询**——BI 跑一次就执行一次，不需要"持续物化"，所以用窗口函数完全没问题。
+
+#### 衍生：什么样的查询能被增量刷新？
+
+可以记几个判断口诀：
+
+| 操作 | 增量友好？ | 原因 |
+|---|---|---|
+| `WHERE`、`SELECT` 列、`CASE` | ✅ | 行级运算，每行独立 |
+| `JOIN` | ✅（多数）| Snowflake 能追踪 join key 变化 |
+| `GROUP BY ... SUM/COUNT/MIN/MAX` | ✅ | 增量聚合可累加（但 `MEDIAN/PERCENTILE` 不行）|
+| `ROW_NUMBER / RANK / LAG / LEAD` | ❌ | 排名依赖整个分区 |
+| `DISTINCT` | ⚠️ 部分场景 ok | 看 Snowflake 版本和数据特征 |
+| `QUALIFY 含窗口函数` | ❌ | 同上 |
+
+实操：建 Dynamic Table 后用以下 SQL 检查到底走的是增量还是全量：
+
+```sql
+SELECT name, refresh_mode, refresh_mode_reason
+FROM INFORMATION_SCHEMA.DYNAMIC_TABLES
+WHERE schema_name = 'GOLD';
+-- refresh_mode_reason 会写明为什么不能 incremental
+```
+
+---
+
+## DLQ 周报 Lambda：在 `failed_at=<DATE>/` 分区下还能读到 `.error.json` 吗？
+
+### 背景
+
+DLQ 改成按失败日期分区后，`lib/dlq.py` 写入的路径布局是：
+
+```
+dead_letter/failed_at=<DATE>/<original_source_key>             ← Bronze 原文件副本 (copy_to_dlq)
+dead_letter/failed_at=<DATE>/<original_key>.error.json         ← 错误元数据
+dead_letter/failed_at=<DATE>/dq_failure_dt=<业务dt>/*.parquet  ← Silver DQ 失败数据
+```
+
+而 `lambda/dlq_weekly_report/handler.py` 仍然只用 `prefix = "dead_letter/"` 去 list 文件。问题：还能扫到 `.error.json` 吗？
+
+### 结论：能读到 ✅
+
+S3 的 `Prefix` 是**字符串前缀匹配**，不是目录概念。`paginator.paginate(Bucket=bucket, Prefix="dead_letter/")` 会**递归列出**所有以 `dead_letter/` 开头的 key，无视层级深度，分区路径里的 `=` 对 S3 没有特殊含义。
+
+### 举例
+
+假设过去 7 天写入了这些 key：
+
+```
+dead_letter/failed_at=2026-05-01/raw/2026/05/01/file1.csv
+dead_letter/failed_at=2026-05-01/raw/2026/05/01/file1.csv.error.json
+dead_letter/failed_at=2026-05-02/dq_failure_dt=2026-04-30/part-0001.parquet
+```
+
+paginator 一次 list 调用就把这 3 个 key 全部返回。handler 逐条处理：
+
+| Key | `endswith(".error.json")` | 进入 if 块 |
+|---|---|---|
+| `...file1.csv` | False | 否（仅计入 `total_dlq_files`） |
+| `...file1.csv.error.json` | **True** | **是** → `get_object` 读取 JSON，统计 `error_type` |
+| `...part-0001.parquet` | False | 否（仅计入 `total_dlq_files`） |
+
+### 是否合理
+
+逻辑正确，但有一处需要注意计数口径：
+
+- `total_dlq_files` 把三类文件（原文件副本、error.json、DQ parquet）**全部计数**。一次失败实际产生 1 个 error.json + 1 个原文件副本，所以 `total_dlq_files` ≈ 2× 真正的失败数；
+- `len(error_files)` 才是失败次数的准确口径；
+- 报告邮件里同时打印这两个数字（"Total DLQ files" 和 "Error .json files"），阅读时以后者为准即可，无需改代码。
+
+

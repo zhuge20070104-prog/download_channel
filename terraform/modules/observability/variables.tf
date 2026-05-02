@@ -59,12 +59,6 @@ variable "dropzone_freshness_schedule" {
   default     = "cron(0 11 * * ? *)"
 }
 
-variable "expected_dropzone_versions" {
-  description = "Schema version subdirs expected under dropzone (e.g. wide, narrow)"
-  type        = list(string)
-  default     = ["wide"]
-}
-
 variable "expected_dropzone_stores" {
   description = "App stores expected daily under dropzone"
   type        = list(string)

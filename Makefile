@@ -69,13 +69,15 @@ deploy-infra-phase1: ## Phase 1: TF apply (infra + Snowflake, no triggers)
 		-target=module.snowflake
 
 .PHONY: apply-snowflake-sql
-apply-snowflake-sql: ## Phase 2: Run Snowflake SQL (01-08)
+apply-snowflake-sql: ## Phase 2: Run Snowflake SQL (01-08). Pass FORCE=1 to bypass the "stateful object already exists" safety gate (required for redeploys).
 	@ALERT_EMAIL_VAL=$$(grep -E '^\s*alarm_email\s*=' $(TF_DIR)/environments/$(ENV).tfvars | sed -E 's/.*=\s*"([^"]+)".*/\1/'); \
 	if [ -z "$$ALERT_EMAIL_VAL" ]; then \
 		echo "ERROR: alarm_email not found in $(TF_DIR)/environments/$(ENV).tfvars"; exit 1; \
 	fi; \
+	FORCE_FLAG=""; \
+	if [ "$(FORCE)" = "1" ]; then FORCE_FLAG="--force"; fi; \
 	echo "Using alert email: $$ALERT_EMAIL_VAL"; \
-	bash scripts/apply_snowflake_sql.sh "$(ENV)" "$(AWS_ACCOUNT_ID)" "$$ALERT_EMAIL_VAL"
+	bash scripts/apply_snowflake_sql.sh $$FORCE_FLAG "$(ENV)" "$(AWS_ACCOUNT_ID)" "$$ALERT_EMAIL_VAL"
 
 .PHONY: deploy-infra-phase2
 deploy-infra-phase2: ## Phase 3: Full TF apply (triggers enabled)

@@ -9,7 +9,7 @@ USE SCHEMA GOLD;
 -- ════════════════════════════════════════════════════════════════
 
 CREATE OR REPLACE DYNAMIC TABLE DC_DAILY_BY_APP
-  TARGET_LAG = '15 minutes'
+  TARGET_LAG = '30 minutes'
   WAREHOUSE  = COMPUTE_WH_DC_${ENV}
   COMMENT    = 'Daily downloads aggregated by app and store'
 AS
@@ -22,8 +22,6 @@ SELECT
   SUM(downloads_organic)         AS downloads_organic,
   AVG(paid_share)                AS avg_paid_share,
   AVG(featured_share)            AS avg_featured_share,
-  COUNT(DISTINCT country)        AS country_count,
-  COUNT(DISTINCT device)         AS device_count,
   COUNT(*)                       AS row_count
 FROM IODP_DC_${ENV}.SILVER.DC_WIDE
 GROUP BY dt, product_id, app_store;
@@ -33,7 +31,7 @@ GROUP BY dt, product_id, app_store;
 -- ════════════════════════════════════════════════════════════════
 
 CREATE OR REPLACE DYNAMIC TABLE DC_DAILY_BY_COUNTRY
-  TARGET_LAG = '15 minutes'
+  TARGET_LAG = '30 minutes'
   WAREHOUSE  = COMPUTE_WH_DC_${ENV}
   COMMENT    = 'Daily downloads aggregated by country and store'
 AS
@@ -44,8 +42,6 @@ SELECT
   SUM(downloads_total)           AS downloads_total,
   SUM(downloads_featured)        AS downloads_featured,
   SUM(downloads_organic)         AS downloads_organic,
-  COUNT(DISTINCT product_id)     AS app_count,
-  COUNT(DISTINCT device)         AS device_count,
   COUNT(*)                       AS row_count
 FROM IODP_DC_${ENV}.SILVER.DC_WIDE
 GROUP BY dt, country, app_store;

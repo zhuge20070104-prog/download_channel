@@ -6,12 +6,14 @@ Lambda: dropzone 数据缺失检测（PLAN.md §14 告警 #6）
 对每个 (schema_version, store) 组合都要求至少有一个文件，否则告警。
 
 PLAN.md §8 dropzone 路径布局:
-  s3://<dropzone>/download_channel/{narrow|wide}/dt=YYYY-MM-DD/store=<store>/*.csv.gz
+  s3://<dropzone>/download_channel/narrow/dt=YYYY-MM-DD/store=<store>/*.csv.gz
+
+dropzone 业务上只上传 narrow（v1）；wide 由 Silver 侧 pivot 生成，不在 dropzone 里出现。
+所以 schema version 直接写死为 "narrow"，不再做参数。
 
 环境变量:
   DROPZONE_BUCKET:        上游桶名
   DROPZONE_PREFIX:        默认 "download_channel/"
-  EXPECTED_VERSIONS:      逗号分隔，默认 "wide"（v1 已停用就不查）
   EXPECTED_STORES:        逗号分隔，默认 "ios,google-play"
   CHECK_DATE_OFFSET_DAYS: 检查哪天的数据，默认 0 (今天 UTC)；可设 -1 检查昨天
   SNS_TOPIC_ARN:          告警 SNS Topic ARN
@@ -23,10 +25,12 @@ from datetime import datetime, timedelta, timezone
 import boto3
 
 
+SCHEMA_VERSION = "narrow"
+
+
 def handler(event, context):
     bucket = os.environ["DROPZONE_BUCKET"]
     prefix_root = os.environ.get("DROPZONE_PREFIX", "download_channel/").rstrip("/") + "/"
-    versions = [v.strip() for v in os.environ.get("EXPECTED_VERSIONS", "wide").split(",") if v.strip()]
     stores = [s.strip() for s in os.environ.get("EXPECTED_STORES", "ios,google-play").split(",") if s.strip()]
     offset_days = int(os.environ.get("CHECK_DATE_OFFSET_DAYS", "0"))
     sns_topic = os.environ["SNS_TOPIC_ARN"]
@@ -40,18 +44,17 @@ def handler(event, context):
     missing = []
     found = []
 
-    for version in versions:
-        for store in stores:
-            partition_prefix = (
-                f"{prefix_root}{version}/dt={dt_str}/store={store}/"
-            )
-            resp = s3.list_objects_v2(
-                Bucket=bucket, Prefix=partition_prefix, MaxKeys=1
-            )
-            if resp.get("KeyCount", 0) == 0:
-                missing.append(f"{version}/dt={dt_str}/store={store}")
-            else:
-                found.append(f"{version}/dt={dt_str}/store={store}")
+    for store in stores:
+        partition_prefix = (
+            f"{prefix_root}{SCHEMA_VERSION}/dt={dt_str}/store={store}/"
+        )
+        resp = s3.list_objects_v2(
+            Bucket=bucket, Prefix=partition_prefix, MaxKeys=1
+        )
+        if resp.get("KeyCount", 0) == 0:
+            missing.append(f"{SCHEMA_VERSION}/dt={dt_str}/store={store}")
+        else:
+            found.append(f"{SCHEMA_VERSION}/dt={dt_str}/store={store}")
 
     if not missing:
         print(f"All expected partitions present for {dt_str}: {found}")
@@ -61,7 +64,7 @@ def handler(event, context):
         "Download Channel ETL — Upstream Data Missing",
         f"Check date (UTC):  {dt_str}",
         f"Dropzone bucket:   {bucket}",
-        f"Expected versions: {versions}",
+        f"Schema version:    {SCHEMA_VERSION}",
         f"Expected stores:   {stores}",
         "",
         f"Missing partitions ({len(missing)}):",

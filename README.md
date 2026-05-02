@@ -111,6 +111,31 @@ make init ENV=dev
 make run-etl ENV=dev
 ```
 
+## One-time Setup: Snowflake User Email for Alerts
+
+`08_freshness_alert.sql` creates an `EMAIL` notification integration that calls `SYSTEM$SEND_EMAIL`. Snowflake will only deliver to addresses that are:
+
+1. **Bound to a Snowflake user** in this account (the `EMAIL` property of some `USER`)
+2. **Verified** by clicking the link Snowflake mails to that address
+
+Neither step is automatable from Terraform / SQL — they are operator actions you must do once per environment, before Phase 4. **Without this, deployment succeeds but alerts silently fail at runtime.**
+
+```sql
+-- as SECURITYADMIN (or any role with MANAGE GRANTS)
+-- Option A: rebind an existing user
+ALTER USER <username> SET EMAIL='ops-oncall@example.com';
+
+-- Option B: dedicated alerts user
+CREATE USER alerts_recipient
+  EMAIL='ops-oncall@example.com'
+  MUST_CHANGE_PASSWORD=FALSE
+  DEFAULT_ROLE=PUBLIC;
+```
+
+Then check the inbox of the address and click the verification link Snowflake sends.
+
+`apply_snowflake_sql.sh`'s **Preflight 1** detects whether the address is at least registered — but it cannot detect whether you have clicked the verification link, so the click is on you. The `alarm_email` value in `terraform/environments/<env>.tfvars` must match the email bound above.
+
 ## Deployment Phases
 
 The deploy is split into 6 phases because of a **bidirectional IAM trust** between AWS and Snowflake:
@@ -120,11 +145,31 @@ The deploy is split into 6 phases because of a **bidirectional IAM trust** betwe
 | 1/6 | `make check-tools check-aws check-snowflake` | Validate prerequisites |
 | 2/6 | `make upload-glue-scripts` | Package `glue/lib/` → `lib.zip`, upload to S3 |
 | 3/6 | `make deploy-infra-phase1` | Terraform apply (storage, DynamoDB, Snowflake DB/Integration) — gets `STORAGE_AWS_IAM_USER_ARN` |
-| 4/6 | `make apply-snowflake-sql` | snowsql runs 01-08: tables, pipe, dynamic tables, dedup task, freshness alerts |
+| 4/6 | `make apply-snowflake-sql` | snowsql runs 01-08: tables, pipe, dynamic tables, dedup task, freshness alerts. Two preflights run first: (1) ALERT_EMAIL is bound to a Snowflake user (hard-fails if not); (2) checks whether stateful objects (PIPE / DYNAMIC TABLE / TASK / NOTIFICATION INTEGRATION / ALERT) from a prior deploy exist. If they do, the four files that recreate them are **skipped** with a warning so that `make init` can replay safely; only the idempotent files (01, 03, 07) re-run. Pass `FORCE=1` to redeploy stateful objects too — see "Re-running phase 4" below. |
 | 5/6 | `make deploy-infra-phase2` | Full Terraform apply — creates IAM trust with Snowflake ARN, enables triggers |
 | 6/6 | `make run-etl ENV=dev` | Verify end-to-end |
 
 **Why two Terraform phases?** Snowflake's Storage Integration creates an IAM user ARN that must be trusted by the AWS IAM role. Phase 1 creates the integration to get the ARN; Phase 2 uses it in the trust policy.
+
+### Re-running phase 4
+
+The first run of `make apply-snowflake-sql ENV=<env>` works on a clean account and runs all 8 SQL files. On every subsequent run the script detects existing stateful objects from the prior deploy and **skips the four files that would recreate them** (`04_pipe.sql`, `05_gold_dynamic_tables.sql`, `06_dedup_task.sql`, `08_freshness_alert.sql`). The three idempotent files (`01_database_schemas.sql`, `03_silver_table.sql`, `07_bi_view.sql`) still run — they are safe replays (`IF NOT EXISTS` / stateless `VIEW`).
+
+This default is what makes `make init` replay-safe: re-running it will not blow away your Pipe load history, retrigger Dynamic Table full refreshes, or briefly silence alerts.
+
+If you actually changed Pipe / Dynamic Table / Task / Alert / Notification Integration definitions (or the `alarm_email` in tfvars), redeploy with `FORCE=1`:
+
+```bash
+make apply-snowflake-sql ENV=dev FORCE=1
+```
+
+Side effects when forcing:
+- **PIPE**: load history is reset. Files still in the stage may be reprocessed (the dedup task in `06_dedup_task.sql` cleans up duplicates by `_loaded_at`).
+- **DYNAMIC TABLE**: triggers a full refresh on next cycle. Burns warehouse credits proportional to upstream `DC_WIDE` size.
+- **TASK / ALERT**: brief suspend → recreate → resume gap (~ms). No alerts fire during the gap.
+- **NOTIFICATION INTEGRATION**: recreated; `ALLOWED_RECIPIENTS` picks up the current `alarm_email`.
+
+Edge case: if `03_silver_table.sql` already exists and you added/removed columns, `CREATE TABLE IF NOT EXISTS` will not migrate the schema — neither default nor `FORCE=1` mode does this. Run an explicit `ALTER TABLE` migration manually.
 
 ## Terraform Modules
 
@@ -207,12 +252,11 @@ All alerts publish to a single SNS topic (`iodp-dc-alerts-<env>`) subscribed to 
 
 Bonus: `IODP_DC_DYNAMIC_TABLE_LAG_<ENV>` Snowflake Alert flags failed Gold Dynamic Table refreshes.
 
-**⚠ Snowflake email setup** — `SYSTEM$SEND_EMAIL` only delivers to addresses **verified on a Snowflake user profile in this account**. Before deploying, log into Snowflake → Account → Users & Roles → set & verify the email on the user that receives the alert. Otherwise alerts #4 (and the Dynamic-Table bonus) will silently fail at runtime even though Terraform / `apply-snowflake-sql` succeed.
+**⚠ Snowflake email setup** — `SYSTEM$SEND_EMAIL` only delivers to addresses bound to a Snowflake user **and verified** in this account. See [One-time Setup: Snowflake User Email for Alerts](#one-time-setup-snowflake-user-email-for-alerts) above. `apply_snowflake_sql.sh` runs a registration preflight that catches the missing-binding case; the verification-link click is the operator's responsibility. If skipped, alerts #4 (and the Dynamic-Table bonus) silently fail at runtime even though deployment succeeds.
 
 **Tunable schedules** (in `terraform/modules/observability/variables.tf`):
 - `stale_lock_check_schedule` (default `rate(30 minutes)`)
 - `dropzone_freshness_schedule` (default `cron(0 11 * * ? *)`)
-- `expected_dropzone_versions` (default `["wide"]` — add `"narrow"` if v1 still active)
 - `expected_dropzone_stores` (default `["ios", "google-play"]`)
 
 ## DLQ & Replay

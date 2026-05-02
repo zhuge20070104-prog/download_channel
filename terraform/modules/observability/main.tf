@@ -329,7 +329,6 @@ resource "aws_lambda_function" "dropzone_freshness_check" {
     variables = {
       DROPZONE_BUCKET        = var.dropzone_bucket_name
       DROPZONE_PREFIX        = "download_channel/"
-      EXPECTED_VERSIONS      = join(",", var.expected_dropzone_versions)
       EXPECTED_STORES        = join(",", var.expected_dropzone_stores)
       CHECK_DATE_OFFSET_DAYS = "0"
       SNS_TOPIC_ARN          = aws_sns_topic.alerts.arn

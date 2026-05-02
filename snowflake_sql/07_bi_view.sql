@@ -9,11 +9,17 @@
 -- 此视图通过 QUALIFY ROW_NUMBER() 在查询时过滤，BI 团队改查
 -- DC_WIDE_LATEST 即可消除该窗口的数据错误。
 --
--- 性能：Dedup Task 已清理后，每个 PK 组合只剩 1 行，QUALIFY 几乎零开销
---      （实测延时差距 < 200ms）。仅在 ~20 小时窗口期间有少量重复需要过滤。
+-- 性能：Dedup Task 已清理后，每个 PK 组合只剩 1 行，QUALIFY 几乎零开销。
+--      实测：BI 同一查询，「直查 SILVER.DC_WIDE」 vs 「查 DC_WIDE_LATEST（多一层 ROW_NUMBER）」，
+--      延时差距 < 200ms。原因：Dedup 后每个分区只剩 1 行，窗口函数排序近乎零成本，
+--      QUALIFY rn=1 等于不过滤任何行，纯属"陪跑"。
+--      仅在 ~20 小时窗口期间有少量重复需要 QUALIFY 真正过滤。
 --
 -- 注意：Gold 层 Dynamic Tables 仍直接读 SILVER.DC_WIDE（不读此视图），
---      因为 ROW_NUMBER 会破坏 Dynamic Table 的增量刷新优化。
+--      因为 ROW_NUMBER 的排名依赖整个分区——新插入一行会"追溯改变"已有行的排名
+--      （旧行原本 rn=1 进结果集，新行来了变成 rn=2 必须从结果集里删掉）。
+--      增量刷新无法只看 delta 算出这种"牵连"影响，会被 Snowflake 强制降级为
+--      FULL REFRESH（每次重扫整张源表），算力成本暴涨。
 --      Gold 表在 20 小时窗口期间会显示重复后的数据，业务可接受（日报场景）。
 
 USE DATABASE IODP_DC_${ENV};

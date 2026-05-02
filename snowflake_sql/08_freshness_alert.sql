@@ -13,13 +13,17 @@
 USE DATABASE IODP_DC_${ENV};
 
 -- ════════════════════════════════════════════════════════════════
---  Email Notification Integration (account-level, idempotent)
+--  Email Notification Integration (account-level)
 --
 --  ALERT_EMAIL 在 apply_snowflake_sql.sh 阶段由 ${ALERT_EMAIL} 占位符注入。
 --  邮箱地址必须先在 Snowflake 用户档案里 verify 过，否则 SYSTEM$SEND_EMAIL 会失败。
+--  apply_snowflake_sql.sh 的 preflight 会拦下未注册的邮箱（详见 README）。
+--
+--  使用 CREATE OR REPLACE（而非 IF NOT EXISTS）以便修改 alarm_email 后重新部署
+--  时 ALLOWED_RECIPIENTS 真的更新；未变更时配合 --force 才会执行。
 -- ════════════════════════════════════════════════════════════════
 
-CREATE NOTIFICATION INTEGRATION IF NOT EXISTS IODP_DC_EMAIL_NOTIF_${ENV}
+CREATE OR REPLACE NOTIFICATION INTEGRATION IODP_DC_EMAIL_NOTIF_${ENV}
   TYPE               = EMAIL
   ENABLED            = TRUE
   ALLOWED_RECIPIENTS = ('${ALERT_EMAIL}')
