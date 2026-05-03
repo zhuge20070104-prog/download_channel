@@ -81,7 +81,7 @@ for page in paginator.paginate(Bucket=BRONZE_BUCKET, Prefix=dlq_prefix):
         if original_source_key.endswith(".error.json"):
             archive_only.append(key)
         elif original_source_key.startswith("dq_failure_dt="):
-            # Silver DQ 失败数据：宽表 schema，无法回 dropzone（dropzone 是 v1 窄表）
+            # Silver DQ 失败数据：宽表 schema，无法回 dropzone（dropzone 是窄表）
             archive_only.append(key)
         else:
             replayables.append((key, original_source_key))

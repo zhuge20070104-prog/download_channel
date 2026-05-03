@@ -10,13 +10,13 @@ Data.ai 下载渠道数据 ETL 管线 — 从 S3 Dropzone 到 Snowflake 的 Meda
     ▼
 ┌─────────────────┐
 │   S3 Dropzone   │  (external, read-only)
-│  narrow/ wide/  │
+│     narrow/     │
 └────────┬────────┘
          │  EventBridge (UTC 10:00 daily)
          ▼
 ┌─────────────────┐     ┌──────────────┐
 │  Glue Bronze    │────▶│  S3 Bronze   │  Parquet, dt/store partitioned
-│  (validate +    │     │  v1/ + v2/   │
+│  (validate +    │     │  narrow/     │
 │   dedup + type) │     │  dead_letter/│
 └────────┬────────┘     └──────────────┘
          │  Glue Workflow (CONDITIONAL trigger)
@@ -190,9 +190,8 @@ Edge case: if `03_silver_table.sql` already exists and you added/removed columns
 
 ```
 s3://iodp-dc-bronze-<env>-<acct>/
-    download_channel/v1/dt=.../store=.../    # Narrow Parquet
-    download_channel/v2/dt=.../store=.../    # Wide Parquet
-    dead_letter/YYYY-MM-DD/                  # Failed files + .error.json
+    download_channel/narrow/dt=.../store=.../    # Narrow Parquet (raw schema preserved)
+    dead_letter/YYYY-MM-DD/                      # Failed files + .error.json
 
 s3://iodp-dc-silver-<env>-<acct>/
     download_channel/dt=.../store=.../       # Unified wide Parquet (Snowpipe reads here)

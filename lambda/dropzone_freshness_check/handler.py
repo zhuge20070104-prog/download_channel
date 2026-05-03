@@ -8,7 +8,7 @@ Lambda: dropzone 数据缺失检测（PLAN.md §14 告警 #6）
 PLAN.md §8 dropzone 路径布局:
   s3://<dropzone>/download_channel/narrow/dt=YYYY-MM-DD/store=<store>/*.csv.gz
 
-dropzone 业务上只上传 narrow（v1）；wide 由 Silver 侧 pivot 生成，不在 dropzone 里出现。
+dropzone 业务上只上传 narrow；wide 由 Silver 侧 pivot 生成，不在 dropzone 里出现。
 所以 schema version 直接写死为 "narrow"，不再做参数。
 
 环境变量:

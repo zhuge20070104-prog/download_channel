@@ -1,6 +1,6 @@
 # glue/lib/schema_v1_narrow.py
 """
-Download Channel 窄表 (v1) Schema 定义
+Download Channel 窄表 Schema 定义
 
 Bronze 层保留原始窄表格式：每行一个 (date, app, country, device, channel) 的下载量。
 Silver Glue Job 负责将窄表 pivot 成宽表。

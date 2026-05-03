@@ -30,7 +30,7 @@
 | 文件格式 | 上游可能是 **gzip CSV** 或 **Parquet**（待 Data.ai 同事确认；Bronze 落 Parquet） |
 | 分区 | 按日期：`s3://…/download_channel/dt=YYYY-MM-DD/<schema_version>/part-*.csv.gz` |
 | 到达节奏 | 每天一批，但 **trailing 7 天会被 restate**（preview → finalized）。Data.ai API 文档里写"Weekly finalized Tue 8am PT"，我们的 Glue Job 必须做幂等覆盖写入 |
-| Schema 版本 | **v1 = 窄表**（早期），**v2 = 宽表**（当前）。两套并存，靠目录前缀 `narrow/` vs `wide/` 区分。Glue Job 根据前缀走不同分支 |
+| Schema 版本 | **窄表**（dropzone 当前唯一上传格式）。早期设计预留过 `wide/` 上传分支，但实际从未启用，已下线。Silver 层做 narrow → wide pivot |
 | 无 PII | 通道下载量是聚合数据，不含用户级 PII；但 `product_id`（App 唯一 ID）按合同保密，不出 AWS 账号 |
 
 ## 3. 架构总览
@@ -97,7 +97,7 @@
                                  业务方 / BI
 ```
 
-- **Bronze（S3 Parquet）**：Glue Bronze Job 清洗后写入，**保留原始 schema**（窄表路径 `v1/`、宽表路径 `v2/`）。Glue Catalog 注册，Athena 可即席查（故障排查用）。
+- **Bronze（S3 Parquet）**：Glue Bronze Job 清洗后写入，**保留原始 schema**（窄表路径 `narrow/`）。Glue Catalog 注册，Athena 可即席查（故障排查用）。
 - **Silver（S3 Parquet）**：Glue Silver Job 做窄→宽 pivot + DQ 校验，**统一为宽表 schema** 输出。所有数据到这一层都是同一套列。
 - **Snowflake Silver 表**：Snowpipe 从 Silver S3 自动 `COPY INTO`，只有 **1 张表 `DC_WIDE`**、**1 条 Pipe**。
 - **Gold（Snowflake Dynamic Tables）**：基于 Silver 表的预聚合，Snowflake 内置增量 + 自动调度。
@@ -110,7 +110,7 @@
 - **Glue Bronze Job 职责**（把"乱"的 raw 变成"齐整"的 Bronze）：
   1. **查 DynamoDB checkpoint**：读取上次处理到哪个 `(dt, store)` 分区、文件 MD5，确定本次需要处理的增量文件 + restate 文件
   2. 读 dropzone：支持 gzip-csv 和 parquet 两种输入
-  3. **Schema 校验**：对照 [§5/§6](#5-数据模型--窄表v1) 的字段表逐列校验。失败文件 → DLQ
+  3. **Schema 校验**：对照 [§5/§6](#5-数据模型--窄表bronze-层保留原始格式) 的字段表逐列校验。失败文件 → DLQ
   4. **类型规范化**：日期 → DATE、数值 → DOUBLE、字符串 trim
   5. **去重**：以 (dt, product_id, country, device, channel) 为 key（窄表）或 (dt, product_id, country, device) 为 key（宽表）
   6. **写 Bronze**：Parquet snappy，路径见 [§8](#8-s3-目录布局)
@@ -120,8 +120,8 @@
 ### 4.2 Bronze S3 → Glue Silver Job → Silver S3（**Silver 化**）
 
 - **触发**：由 Glue Workflow 串联，Bronze Job 成功后自动触发 Silver Job。
-- **Silver Job 职责**（把 Bronze 的窄/宽两种 schema 统一为 **一套宽表 schema**）：
-  1. 读 Bronze v1（窄表）→ pivot 成宽表格式：
+- **Silver Job 职责**（把 Bronze 的窄表 pivot 成统一宽表 schema）：
+  1. 读 Bronze 窄表 → pivot 成宽表格式：
      ```
      GROUP BY (dt, product_id, app_store, country, device)
      SUM(IFF(channel IN ('paid_featured','unpaid_featured'), downloads, 0)) AS downloads_featured
@@ -129,10 +129,9 @@
      ...（四象限叶子列同理）
      downloads_total = downloads_featured + downloads_organic
      ```
-  2. 读 Bronze v2（宽表）→ 直接透传（已经是宽表 schema）
-  3. **DQ 卡点**（见 [§12](#12-dq-卡点)）：通过 → 写 Silver；不通过 → 写 DLQ + 告警，不写 Silver
-  4. **写 Silver**：统一宽表 Parquet，路径 `s3://silver-bucket/download_channel/dt=YYYY-MM-DD/store=<store>/*.parquet`
-  5. **Restate 覆盖**：与 Bronze 同理，先 DELETE 对应分区再写
+  2. **DQ 卡点**（见 [§12](#12-dq-卡点)）：通过 → 写 Silver；不通过 → 写 DLQ + 告警，不写 Silver
+  3. **写 Silver**：统一宽表 Parquet，路径 `s3://silver-bucket/download_channel/dt=YYYY-MM-DD/store=<store>/*.parquet`
+  4. **Restate 覆盖**：与 Bronze 同理，先 DELETE 对应分区再写
 
 ### 4.3 Silver S3 → Snowpipe → Snowflake Silver（**Snowflake 化**）
 
@@ -150,9 +149,9 @@
   - 不需要外部 Airflow / Glue Trigger
 - **每张 Gold 表**：见 [§9](#9-snowflake-对象布局)。
 
-## 5. 数据模型 — 窄表（v1，Bronze 层保留原始格式）
+## 5. 数据模型 — 窄表（Bronze 层保留原始格式）
 
-> 早期格式。每行一个 (date, app, country, device, channel) 的下载量。**EAV 风格**，扩展性好但聚合时要 PIVOT。Bronze 层保留原样；Silver Glue Job 负责 pivot 成宽表。
+> dropzone 唯一上传格式。每行一个 (date, app, country, device, channel) 的下载量。**EAV 风格**，扩展性好但聚合时要 PIVOT。Bronze 层保留原样；Silver Glue Job 负责 pivot 成宽表。
 
 | 列 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -171,15 +170,15 @@
 
 **S3 Bronze 分区路径**：
 ```
-s3://iodp-dc-bronze-<env>-<acct>/download_channel/v1/
+s3://iodp-dc-bronze-<env>-<acct>/download_channel/narrow/
     dt=2026-04-25/
     store=ios/
     part-00000.snappy.parquet
 ```
 
-## 6. 数据模型 — 宽表（v2，Silver 层 + Snowflake 统一格式）
+## 6. 数据模型 — 宽表（Silver 层 + Snowflake 统一格式）
 
-> 当前格式，也是 Silver 层和 Snowflake 的统一 schema。每行一个 (date, app, country, device)，channel 被 PIVOT 成多列。Bronze 层的 v2 原样保留；Bronze 层的 v1 由 Silver Glue Job pivot 成此格式。
+> Silver 层和 Snowflake 的统一 schema。每行一个 (date, app, country, device)，channel 被 PIVOT 成多列。由 Silver Glue Job 从 Bronze 窄表 pivot 而来。
 
 | 列 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -210,37 +209,25 @@ s3://iodp-dc-silver-<env>-<acct>/download_channel/
     part-00000.snappy.parquet
 ```
 
-**S3 Bronze v2 分区路径**（原始宽表）：
-```
-s3://iodp-dc-bronze-<env>-<acct>/download_channel/v2/
-    dt=2026-04-25/
-    store=google-play/
-    part-00000.snappy.parquet
-```
-
 > ⚠️ **本节列名属"基于公开方法论 + 用户描述的合理还原"**。Data.ai helpcenter 详细页面是登录态 gated，公开搜索引擎只能看到 paid/organic/featured 三档的描述。落地前需要从登录态 helpcenter 拿一份原始 schema 校对一遍，把列名对齐到 Data.ai 官方字段名。**这是开工前必须做的一件事**。
 
-## 7. 兼容策略：窄 → 宽迁移
+## 7. 兼容策略
 
-- **历史数据不重算**：v1 窄表沉淀的旧数据保留在 Bronze 的 `v1/` 路径里，Silver Glue Job 读取时 pivot 成宽表。
-- **新数据走 v2**：Glue Bronze Job 看 raw 文件路径前缀（`narrow/` vs `wide/`）决定走哪条解析分支，但最终 Bronze 都按原格式写，Silver 统一为宽表。
-- **对外只通过 Snowflake `SILVER.DC_WIDE`**：Gold 层 Dynamic Table 全部基于这张表，业务方完全不感知历史 schema 变化。
-- **窄 → 宽兜底**：如果某天 Data.ai 又只给窄表（回滚），只要 Bronze 仍写到 v1 路径，Silver Glue Job 的 pivot 逻辑依旧正确。
+- **窄 → 宽 pivot 在 Silver 层完成**：Bronze 保留 dropzone 原样的窄表 Parquet，Silver Glue Job 做 pivot。下游业务方完全不感知 EAV 风格的窄表。
+- **对外只通过 Snowflake `SILVER.DC_WIDE`**：Gold 层 Dynamic Table 全部基于这张表。
+- **历史背景**：早期设计预留过"上游也可能直接给宽表"的分支（dropzone `wide/` 前缀 + Bronze `wide/` 旁路），但实际从未启用，已下线。如果未来 Data.ai 又回到双格式上传，Silver pivot 逻辑可以保留，再加一条旁路即可。
 
 ## 8. S3 目录布局
 
 ```
 s3://dataai-dropzone-<env>-<acct>/                ← 上游 PUT，我们只读
     download_channel/
-        narrow/                                    ← v1
-            dt=YYYY-MM-DD/store=<store>/*.csv.gz
-        wide/                                      ← v2
+        narrow/
             dt=YYYY-MM-DD/store=<store>/*.csv.gz
 
 s3://iodp-dc-bronze-<env>-<acct>/                 ← Glue Bronze Job 写
     download_channel/
-        v1/dt=YYYY-MM-DD/store=<store>/*.parquet   ← 窄表原样
-        v2/dt=YYYY-MM-DD/store=<store>/*.parquet   ← 宽表原样
+        narrow/dt=YYYY-MM-DD/store=<store>/*.parquet   ← 窄表原样
     dead_letter/                                   ← 解析/DQ 失败的原文件 + 错误 json
         YYYY-MM-DD/<original-key>
         YYYY-MM-DD/<original-key>.error.json
@@ -457,8 +444,8 @@ download_channel/
 │   ├── silver_etl.py                       ← Glue Silver Job 主入口（含 pivot + DQ）
 │   ├── dlq_replay.py                       ← DLQ 重放 Job
 │   ├── lib/
-│   │   ├── schema_v1_narrow.py             ← v1 窄表 schema 定义
-│   │   ├── schema_v2_wide.py               ← v2 宽表 schema 定义
+│   │   ├── schema_v1_narrow.py             ← Bronze 窄表 schema 定义
+│   │   ├── schema_v2_wide.py               ← Silver 宽表 schema 定义
 │   │   ├── dq_checks.py                    ← §12 DQ 卡点实现
 │   │   ├── checkpoint.py                   ← DynamoDB checkpoint 读写
 │   │   └── dlq.py                          ← 失败写 DLQ
@@ -477,8 +464,7 @@ download_channel/
 │   └── 06_dedup_task.sql                   ← 每日去重 Task
 │
 ├── athena_ddl/                             ← Bronze + Silver 在 Glue Catalog 注册（用于 ad-hoc）
-│   ├── bronze_dc_narrow_v1.sql
-│   ├── bronze_dc_wide_v2.sql
+│   ├── bronze_dc_narrow.sql
 │   └── silver_dc_wide.sql
 │
 ├── scripts/
@@ -576,10 +562,10 @@ download_channel/
 | # | 问题 | 谁来回答 | 阻塞哪一步 |
 |---|---|---|---|
 | 1 | Data.ai 给的文件具体是 csv.gz 还是 parquet？分隔符？header 行有几行？ | Data.ai 数据科学同事 | Glue Bronze parser 实现 |
-| 2 | 窄表 v1 和宽表 v2 的**确切**列名：特别是要确认 (a) 四象限 `paid_featured / paid_organic / unpaid_featured / unpaid_organic` 的官方英文列名是否就是这样拼写；(b) Data.ai 内部是否还保留 `downloads_organic` 的别名（老 SDK/老报表还在用） | 我 / 业务方账号（登录态 helpcenter） | §5 §6 表头精确化 |
+| 2 | 窄表（Bronze）和宽表（Silver）的**确切**列名：特别是要确认 (a) 四象限 `paid_featured / paid_organic / unpaid_featured / unpaid_organic` 的官方英文列名是否就是这样拼写；(b) Data.ai 内部是否还保留 `downloads_organic` 的别名（老 SDK/老报表还在用） | 我 / 业务方账号（登录态 helpcenter） | §5 §6 表头精确化 |
 | 3 | Snowflake 账号已经存在么？还是 Terraform 也要建 Account？ | 平台/IT | §16 snowflake module 边界 |
 | 4 | dropzone 桶在我们账号还是 Data.ai 账号？如果是对方账号，需要 cross-account read role | Data.ai 同事 / 我 | §16 glue_etl IAM |
-| 5 | 历史数据迁移：v1 老数据要不要重新清洗一遍灌入新 Bronze？还是只接新数据？ | 业务方 | 是否需要 backfill |
+| 5 | 历史数据迁移：老数据要不要重新清洗一遍灌入新 Bronze？还是只接新数据？ | 业务方 | 是否需要 backfill |
 | 6 | Gold 层除了我列的 3 张 Dynamic Table，业务方还要哪些维度切片？ | 业务方 | §9 GOLD schema |
 | 7 | 上游 restate 窗口确切是几天？（API 文档说 weekly Tue 8am PT，但 Download Channel 不一定一致） | Data.ai 同事 | Glue 幂等覆盖窗口 |
 | 8 | Glue Job 运行在哪个 VPC / Subnet？是否需要复用 iodp 的网络配置？ | 平台/我 | §16 networking module |

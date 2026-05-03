@@ -4,8 +4,8 @@ Glue Batch Job: Bronze S3 → Silver S3
 
 由 Glue Workflow 在 Bronze Job 成功后自动触发，也可手动运行。
 职责:
-  1. 读 Bronze v1 窄表 Parquet
-  2. Pivot 窄表 → v2 宽表（统一 Silver schema）
+  1. 读 Bronze 窄表 Parquet
+  2. Pivot 窄表 → 宽表（统一 Silver schema）
   3. DQ 卡点（§12）：不通过 → DLQ + 告警，不写 Silver
   4. 写 Silver S3（统一宽表 Parquet）
   5. 更新 checkpoint
@@ -67,12 +67,13 @@ LOOKBACK_CUTOFF_DT = (
 
 s3_client = boto3.client("s3")
 sns_client = boto3.client("sns")
+glue_client = boto3.client("glue")
 checkpoint = CheckpointManager(
     table_name=args["CHECKPOINT_TABLE"],
     aws_region=args.get("AWS_REGION", "us-east-1"),
 )
 
-BRONZE_PREFIX = "download_channel/v1/"
+BRONZE_PREFIX = "download_channel/narrow/"
 
 
 def send_alert(subject: str, message: str):
@@ -87,8 +88,37 @@ def send_alert(subject: str, message: str):
         print(f"[WARN] Failed to send SNS alert: {e}")
 
 
+def register_silver_partition(dt: str, store: str):
+    # Best-effort：Athena 是侧路 ad-hoc 通道，注册失败不阻塞 ETL。
+    # AlreadyExistsException 是预期情况（restate 重写、MSCK 已登记过），静默吞。
+    db_name = f"iodp_dc_silver_{ENVIRONMENT}"
+    table_name = "dc_wide"
+    location = f"s3://{SILVER_BUCKET}/download_channel/dt={dt}/store={store}/"
+    try:
+        glue_client.create_partition(
+            DatabaseName=db_name,
+            TableName=table_name,
+            PartitionInput={
+                "Values": [dt, store],
+                "StorageDescriptor": {
+                    "Location": location,
+                    "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                    "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                    "SerdeInfo": {
+                        "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                    },
+                },
+            },
+        )
+        print(f"[GLUE] Registered Athena partition {dt}/{store}")
+    except glue_client.exceptions.AlreadyExistsException:
+        pass
+    except Exception as e:
+        print(f"[WARN] Failed to register Athena partition {dt}/{store}: {e}")
+
+
 def list_bronze_partitions():
-    """扫描 Bronze v1 分区，返回需要处理的 (dt, store) 列表。"""
+    """扫描 Bronze 窄表分区，返回需要处理的 (dt, store) 列表。"""
     paginator = s3_client.get_paginator("list_objects_v2")
     seen = set()
 
@@ -120,7 +150,7 @@ def list_bronze_partitions():
 
 
 def pivot_narrow_to_wide(narrow_df):
-    """将窄表 (v1) pivot 成宽表 (v2) schema。"""
+    """将窄表 pivot 成 Silver 统一宽表 schema。"""
     pivoted = narrow_df.groupBy("dt", "product_id", "app_store", "country", "device") \
         .agg(
             spark_sum("downloads").alias("downloads_total"),
@@ -279,7 +309,10 @@ def process_partition(dt: str, store: str):
             f"in={in_count:,} out={out_count:,} duration={duration}s"
         )
 
-        # ─── 7. 更新 checkpoint ───
+        # ─── 7. 登记 Athena 分区（best-effort）───
+        register_silver_partition(dt, store)
+
+        # ─── 8. 更新 checkpoint ───
         checkpoint.release_lock(
             layer, dt, store, status="succeeded",
             in_count=in_count, out_count=out_count,

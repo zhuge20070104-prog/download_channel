@@ -213,7 +213,7 @@ DynamoDB 里记录的 MD5 就是"成绩单上写了你是 85 分"。当新的 88
   │                     dropzone 里的文件 MD5 = "ccc..." → 一样 → 跳过，省资源
   │
   ├── 对需要处理的日期:
-  │     Bronze: 先 DELETE s3://bronze/.../v1/dt=2026-04-24/store=ios/*.parquet
+  │     Bronze: 先 DELETE s3://bronze/.../narrow/dt=2026-04-24/store=ios/*.parquet
   │             再写新的 parquet 文件
   │     更新 DynamoDB: file_md5 = "bbb...", status = "succeeded"
   │
@@ -824,10 +824,10 @@ silver#2026-04-25#ios   ← Silver Job 自己的状态
 
 | 步骤 | Bronze Job | Silver Job |
 |---|---|---|
-| 读 | dropzone csv.gz / parquet | Bronze v1 或 v2 parquet |
-| 转换 | csv → parquet，schema 校验，类型规范化，按 PK 去重 | **窄表 v1 → 宽表 pivot**（v2 透传），算 paid_share / featured_share |
+| 读 | dropzone csv.gz / parquet | Bronze 窄表 parquet |
+| 转换 | csv → parquet，schema 校验，类型规范化，按 PK 去重 | **窄表 → 宽表 pivot**，算 paid_share / featured_share |
 | 校验 | schema 列名 / 类型 | **5 项 DQ Check**（行数、空值率、日期范围、负数、等式） |
-| 写入路径 | `bronze/v1/...` 或 `bronze/v2/...`（保留 schema 版本） | `silver/...`（统一宽表，不分 v1/v2） |
+| 写入路径 | `bronze/narrow/...` | `silver/...`（统一宽表） |
 | Schema 输出 | 跟 Data.ai 给的一样 | **统一为宽表 schema**，下游全部基于这套列 |
 
 #### 精确说法
@@ -851,9 +851,9 @@ silver#2026-04-25#ios   ← Silver Job 自己的状态
 
 | 时刻 | 操作 | 影响 |
 |---|---|---|
-| 4/25 10:00 | Data.ai PUT `dropzone/wide/dt=2026-04-24/store=ios/wide.csv.gz`（MD5=aaa111，downloads=1000） | dropzone 有 1 个文件 |
+| 4/25 10:00 | Data.ai PUT `dropzone/narrow/dt=2026-04-24/store=ios/narrow.csv.gz`（MD5=aaa111，downloads=1000） | dropzone 有 1 个文件 |
 | 4/25 10:00 | EventBridge 触发 Bronze Job → 查 DynamoDB `bronze#2026-04-24#ios` 不存在 → 处理 | DynamoDB 写入 file_md5=aaa111, status=succeeded |
-| 4/25 10:01 | Bronze 写 `bronze/v2/dt=2026-04-24/store=ios/part-00000.snappy.parquet`（downloads=1000） | Bronze S3 有 1 个文件 |
+| 4/25 10:01 | Bronze 写 `bronze/narrow/dt=2026-04-24/store=ios/part-00000.snappy.parquet`（downloads=1000） | Bronze S3 有 1 个文件 |
 | 4/25 10:02 | Silver Job 由 Workflow 拉起 → DQ 通过 → 写 `silver/.../dt=2026-04-24/store=ios/part-00000.snappy.parquet` | Silver S3 有 1 个文件，触发 ObjectCreated |
 | 4/25 10:05 | Snowpipe 自动 COPY INTO → 表里新增 1 行 `{downloads_total=1000, _loaded_at='2026-04-25 10:05'}` | SILVER.DC_WIDE 1 行 |
 | 4/25 10:20 | Gold Dynamic Table 自动刷新 | GOLD.DC_DAILY_BY_APP 1 行(1000) |
@@ -864,9 +864,9 @@ silver#2026-04-25#ios   ← Silver Job 自己的状态
 
 | 时刻 | 操作 | 影响 |
 |---|---|---|
-| 4/26 10:00 | Data.ai PUT 覆盖 `dropzone/wide/dt=2026-04-24/store=ios/wide.csv.gz`（**MD5=bbb222**，downloads=**1050**） | dropzone 同路径文件被覆盖 |
+| 4/26 10:00 | Data.ai PUT 覆盖 `dropzone/narrow/dt=2026-04-24/store=ios/narrow.csv.gz`（**MD5=bbb222**，downloads=**1050**） | dropzone 同路径文件被覆盖 |
 | 4/26 10:00 | Bronze Job 启动 → DynamoDB file_md5='aaa111' vs 当前 dropzone MD5='bbb222' → **检测到 restate** | 决定要重处理 |
-| 4/26 10:01 | Bronze **DELETE** 旧 `bronze/v2/.../part-00000.snappy.parquet`（物理消失）→ 写新 parquet（1050） | Bronze S3 旧文件已删，新文件 1050 |
+| 4/26 10:01 | Bronze **DELETE** 旧 `bronze/narrow/.../part-00000.snappy.parquet`（物理消失）→ 写新 parquet（1050） | Bronze S3 旧文件已删，新文件 1050 |
 | 4/26 10:02 | Silver Job 同理 → DELETE 旧 Silver parquet → 写新 Silver parquet（1050） | Silver S3 旧文件已删，新文件 1050 |
 | 4/26 10:05 | 🔥 Snowpipe 看到"新文件出现"（**它不订阅 ObjectRemoved**）→ COPY INTO → **新增 Row #2** `{downloads_total=1050, _loaded_at='2026-04-26 10:05'}` | SILVER.DC_WIDE **变成 2 行**（1000 + 1050）⚠️ |
 | 4/26 10:20 | Gold Dynamic Table 重算 → SUM(1000+1050) | GOLD.DC_DAILY_BY_APP 显示 **2050（错！）** ⚠️ |
@@ -2573,4 +2573,233 @@ paginator 一次 list 调用就把这 3 个 key 全部返回。handler 逐条处
 - `len(error_files)` 才是失败次数的准确口径；
 - 报告邮件里同时打印这两个数字（"Total DLQ files" 和 "Error .json files"），阅读时以后者为准即可，无需改代码。
 
+---
+
+## 一次 review 触发的连锁修复：默认值 → 参数下线 → 注册 gap → v1/v2 清理
+
+> 本节记录一次主动 code review 引出的连锁修复。起点是发现一个 Lambda 默认值跟业务现状不符；顺着这条线，又暴露了一个 Athena 分区注册 gap，最后把整个项目里残留的 v1/v2 命名一并清理掉。
+>
+> 每一步都问了一个问题："这个东西在业务上还成立吗？"。三个回答都是"不成立了"，于是连着改了三轮。
+
+### 1. dropzone_freshness_check 的默认 schema version 是反的
+
+#### 1.1 发现
+
+[lambda/dropzone_freshness_check/handler.py](lambda/dropzone_freshness_check/handler.py) 的环境变量 `EXPECTED_VERSIONS` 默认值是 `"wide"`，docstring 上写着"v1 已停用就不查"。这条注释跟代码同时是反的：
+
+- [glue/bronze_etl.py](glue/bronze_etl.py) 里 `DROPZONE_PREFIX = "download_channel/narrow/"` —— 上游实际只上传 narrow
+- "wide" 在 dropzone 里**从未出现过**：项目早期设计预留过 dropzone 直接给宽表的旁路，但实际业务从未启用，全部数据走 narrow → Silver pivot 路径
+- 如果 freshness Lambda 用 `wide` 默认值跑，每天都会告警"upstream missing"——这是个明显走样的告警
+
+这种 bug 是 AI 容易漏掉的那种：从代码本身看不出来（`narrow` 和 `wide` 两个目录都"合法"，默认值是 `wide`，注释也"自洽"），需要业务侧的实际状态才能反过来发现 default 是错的。
+
+#### 1.2 第一轮修：改默认值
+
+最直觉的修法：把默认值从 `"wide"` 改成 `"narrow"`，注释也反过来。这一步 5 秒能改完。
+
+但停下来问一句：**业务上 wide 还有可能回来吗？**
+
+答案是不会。dropzone wide 旁路是早期设计的"万一上游也能直接给宽表"的兜底，4 年来从未启用。即使未来 Data.ai 又给宽表，也可以加一条新分支处理，不需要靠这个 env var 来切。
+
+#### 1.3 第二轮修：把参数本身删掉
+
+既然 `EXPECTED_VERSIONS` 唯一合理的值就是 `"narrow"`，把它当配置项就是死参数：
+
+- 配置面增加了一个永远不会被用到的旋钮
+- 后人读代码会以为"它能配多个值"，去想这个参数的语义
+- terraform 里默认值跟 Python 默认值要保持一致，是个隐性的双写
+
+最终改法：
+
+```python
+# lambda/dropzone_freshness_check/handler.py
+SCHEMA_VERSION = "narrow"  # 模块常量，不再做 env var
+
+def handler(event, context):
+    # ...
+    for store in stores:
+        partition_prefix = f"{prefix_root}{SCHEMA_VERSION}/dt={dt_str}/store={store}/"
+        ...
+```
+
+同时删掉了：
+- `terraform/modules/observability/variables.tf` 里的 `expected_dropzone_versions` 变量定义
+- `terraform/modules/observability/main.tf` 里给 Lambda 注入 `EXPECTED_VERSIONS` env var 的那一行
+- `README.md` 里 "Tunable schedules" 节列出此变量的那一行
+
+#### 1.4 取舍说明
+
+这是个反 YAGNI 的决定。常见的工程默认是"保留灵活性"——env var 留着、terraform 默认值改一下就行。但保留灵活性的代价是**让代码假装它支持一种永远不会发生的场景**，看代码的人多花脑子去想"为什么要可配置"。
+
+判断标准：**如果一个参数所有合法取值都收敛到一个，它就不该是参数。**
+
+### 2. 顺手发现 Athena 看不到新分区
+
+#### 2.1 触发
+
+聊到上一步的 freshness Lambda 时，用户问起 Bronze 那个 Athena DDL 里的 `MSCK REPAIR TABLE` 是干嘛的。这个问题顺出了一个更大的问题：
+
+> 全仓 grep `MSCK` / `create_partition` / `ADD PARTITION` / `add_partition` 的结果是：**只有 DDL 文件里那 3 条 `MSCK REPAIR`，再没有任何分区登记代码**。
+
+这意味着：
+
+- Glue Bronze/Silver Job 写 `dt=2026-05-03/store=ios/` 的新 Parquet → S3 上有数据 ✓
+- 但 Glue Data Catalog 里的 partition 表**不知道**这条新分区存在
+- Athena 查询 `SELECT * WHERE dt='2026-05-03'` → 直接返回 **0 行**（不是报错，是空结果）
+- 唯一登记入口是手动跑 `make apply-athena-ddl`（里面会跑一次 MSCK）
+
+#### 2.2 这个 gap 严不严重？要看 Athena 怎么用
+
+项目主链路是 **dropzone → Glue Bronze → Glue Silver → Snowpipe → Snowflake**。Snowpipe 不靠 Glue Catalog（它读 S3 文件），所以这个 gap **不阻塞主链路**。Athena 是侧路 ad-hoc 通道，影响面取决于实际怎么用：
+
+| 用法 | 受影响吗 |
+|---|---|
+| Spark 读 S3：`spark.read.parquet("s3://.../narrow/")` | ✗ 不受影响。Spark 自己 list S3、自己识别 Hive 风格分区，**绕过 Glue Catalog** |
+| Athena Console 写 SQL：`SELECT ... WHERE dt='today'` | ✓ 受影响。Athena 严格信 Catalog，没登记的分区当不存在，**返回 0 行不报错** |
+
+第二种"返回 0 行不报错"是最坑的——你以为今天没数据，其实是 Catalog 没登记。
+
+#### 2.3 三种修法的取舍
+
+| 方案 | 复杂度 | 代价 |
+|---|---|---|
+| **(a) Partition Projection** | 改 1 个 DDL | Athena 按规则即时算分区路径，不依赖 Catalog 元数据。`SHOW PARTITIONS` 不准（但这个项目不用），所以零运维。**最省事**。 |
+| **(b) `glue.create_partition()` 写入时登记** | 改 2 个 ETL 文件 + 1 行 IAM | 与现有 Hive 表 layout 完全兼容，登记后 `SHOW PARTITIONS` 能用。需要处理 `AlreadyExistsException`。 |
+| **(c) 定时跑 `MSCK REPAIR`** | Lambda + EventBridge | MSCK 随分区数线性变慢，3 个月后 list 几百个目录每天跑一次都嫌贵。**最差**。 |
+| **(d) Apache Iceberg** | Glue Job 切 writer + Glue Catalog 切表类型 + Snowflake 改读 Iceberg 或继续读 Parquet（白写元数据） | Iceberg 真正的卖点是 ACID 写、schema 演进、time travel、行级 update/delete——这些需求**一个都没有**。**杀鸡用牛刀**。 |
+
+最后选了 (b)——不是因为它最简单（其实 (a) 更省事），而是它跟现有架构契合度最高：保留 Hive 表 layout、保留可观测的 partition 列表、跟未来万一引入 dbt 兼容更好。
+
+#### 2.4 实现要点
+
+```python
+# glue/bronze_etl.py
+def register_bronze_partition(dt: str, store: str):
+    # Best-effort：Athena 是侧路，注册失败不阻塞 ETL。
+    # AlreadyExistsException 是预期情况（restate 重写、MSCK 已登记过），静默吞。
+    db_name = f"iodp_dc_bronze_{ENVIRONMENT}"
+    table_name = "dc_narrow"
+    location = f"s3://{BRONZE_BUCKET}/download_channel/narrow/dt={dt}/store={store}/"
+    try:
+        glue_client.create_partition(
+            DatabaseName=db_name,
+            TableName=table_name,
+            PartitionInput={
+                "Values": [dt, store],
+                "StorageDescriptor": {
+                    "Location": location,
+                    "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                    "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                    "SerdeInfo": {
+                        "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                    },
+                },
+            },
+        )
+        print(f"[GLUE] Registered Athena partition {dt}/{store}")
+    except glue_client.exceptions.AlreadyExistsException:
+        pass
+    except Exception as e:
+        print(f"[WARN] Failed to register Athena partition {dt}/{store}: {e}")
+```
+
+调用点放在 Spark 写完 Parquet **之后**、`checkpoint.release_lock` **之前**。Silver ETL 镜像了完全相同的模式（DB/表名/路径不同）。
+
+几个故意做的设计选择：
+
+1. **失败不阻塞**：Athena 是侧路，数据已经在 S3、Snowpipe 主链路不靠 Glue Catalog，所以注册失败只 print warn，job 继续。
+2. **AlreadyExistsException 静默吞**：restate 路径会重写已经存在的分区（`dt=2026-04-25/store=ios` 后续 ETL 又跑一遍），catalog 里那条记录早就有了，再调 `create_partition` 会 409。这是预期情况，不是错误。
+3. **DLQ 路径不注册分区**：DQ 阻断走 DLQ 那条分支不调 `register_*_partition`。DLQ 数据本来就不该被 Athena 查到。
+
+#### 2.5 IAM 的细节坑
+
+[terraform/modules/glue_etl/main.tf](terraform/modules/glue_etl/main.tf) 原本已经有 `glue:BatchCreatePartition`，但**没有** `glue:CreatePartition`。这俩在 AWS IAM 里**是分开的两个 action**：
+
+```diff
+  Action = [
+    "glue:GetDatabase",
+    "glue:GetTable",
+    "glue:CreateTable",
+    "glue:UpdateTable",
+    "glue:GetPartitions",
++   "glue:CreatePartition",
+    "glue:BatchCreatePartition",
+  ]
+```
+
+这是个容易漏的细节——AWS IAM 把 batch 和 single 视为两个独立的 action，看 IAM doc 时如果只看到 `BatchCreatePartition` 容易以为已经覆盖。
+
+### 3. 顺手把 v1/v2 命名一并清理掉
+
+#### 3.1 触发
+
+修完 (2) 之后回头看，发现项目里 v1/v2 命名残留得很严重：
+
+- Athena 表名 `dc_narrow_v1`（v1 后缀已无意义，因为永远没有 v2）
+- S3 路径 `download_channel/v1/`（同上）
+- 整个 [athena_ddl/bronze_dc_wide_v2.sql](athena_ddl/bronze_dc_wide_v2.sql) 文件描述一张永远空的表
+- PLAN.md 第 3 节、第 5 节、第 6 节、第 7 节"兼容策略：窄 → 宽迁移"（这个章节描述的迁移**从未发生过**）大量 v1/v2 占位
+- README.md 架构图里 "narrow/ wide/" 双分支
+- explanation.md restate 时序示例里 `dropzone/wide/...wide.csv.gz`
+
+#### 3.2 这种 stale 命名为什么必须改
+
+不只是审美问题：
+
+1. **每个 v1 后缀都在暗示"v2 存在"**——新人读代码会去找 v2，找不到再去搜 git history，浪费时间
+2. **README 架构图直接误导外部 reviewer**——portfolio 项目里这种图是面试官第一眼看到的
+3. **PLAN.md §7 整章是描述虚构 migration 的**——"v1 老数据保留在 `v1/` 路径里"、"新数据走 v2"——读了之后会以为业务上确实有过迁移
+
+#### 3.3 改动范围
+
+| 维度 | 旧 | 新 |
+|---|---|---|
+| Athena Bronze 表 | `dc_narrow_v1` | `dc_narrow` |
+| Bronze S3 路径 | `download_channel/v1/...` | `download_channel/narrow/...` |
+| Bronze wide 旁路 | `dc_wide_v2` 表 + `download_channel/v2/...` | 全部删除 |
+| Athena DDL 文件 | `bronze_dc_narrow_v1.sql`, `bronze_dc_wide_v2.sql` | `bronze_dc_narrow.sql`（删除 wide） |
+
+修了 11 个文件：DDL（重命名 + 删除 1 个）、bronze_etl.py / silver_etl.py、dlq_replay.py、dropzone_freshness_check handler、PLAN.md、README.md、explanation.md（含本节所在文档之前的 restate 时序示例）、两个 schema lib 的 docstring。
+
+#### 3.4 故意没动的东西（避免过度修复）
+
+| 没动的项目 | 理由 |
+|---|---|
+| Python 模块文件名 `glue/lib/schema_v1_narrow.py` 和 `schema_v2_wide.py` | 这是内部 Python 模块名，不是路径；改名要连带改 import 语句 + 导出常量名（`NARROW_V1_SCHEMA` / `WIDE_V2_SCHEMA`），扩散面大，收益边际 |
+| 导出常量名 `NARROW_V1_PK` / `NARROW_V1_SCHEMA` / `WIDE_V2_SCHEMA` | 同上 |
+| `terraform/modules/glue_catalog/` 里的资源名 `bronze_dc` / `silver_dc` | 这是 Glue **database** 名，本身没有 v1/v2 问题 |
+| `TODOLIST.md` 里 "narrow→wide schema migration" 叙述 | 这是简历/portfolio 的 talking point，描述历史项目的概念演进，不是 stale 路径 |
+
+判断标准是**改动距离用户/数据有多近**：S3 路径和 Athena 表名是对外接口（Athena Console 用户、未来 dbt 代码、文档读者会看到），必须准。Python 内部常量名只在 ETL 代码里用，对外不暴露，先不动也不会误导任何人。
+
+#### 3.5 部署前必须知道的两个 caveat
+
+这次改动**不是兼容性改动**——已部署环境需要手动收尾：
+
+1. **Glue Catalog 旧表对象不会自动删**——已部署的 Catalog 里还有 `dc_narrow_v1` 表对象。新 DDL 跑下去会创建 `dc_narrow` 表，但旧表不会消失：
+
+   ```sql
+   DROP TABLE iodp_dc_bronze_<env>.dc_narrow_v1;
+   ```
+
+2. **S3 旧目录里的历史 Parquet 不会自动迁移**——`download_channel/v1/` 下的历史数据还在原地，新 ETL 会写到 `download_channel/narrow/`。两条选择：
+   - 用 `aws s3 mv --recursive s3://<bronze>/download_channel/v1/ s3://<bronze>/download_channel/narrow/` 把历史搬过来，然后跑一次 MSCK 或新 DDL 让 Catalog 重新登记
+   - 从 dropzone 跑一次 backfill（`make backfill BACKFILL_MODE=true`），让 ETL 重新写到新路径
+
+如果是 portfolio 环境（无生产数据）就直接重新部署完事。
+
+### 4. 这一连串修复的元规律
+
+这三个问题都是同一种 pattern：**代码本身能跑、看起来"自洽"，但业务现实早已变了，代码没跟上**。AI（包括我自己）容易漏掉的部分，恰恰就是这种"业务真值"。
+
+判断要不要修的两条朴素标准：
+
+1. **这个东西在业务上还成立吗？** 如果不成立，stale 命名/默认值/参数都得改。
+2. **修了之后有没有第二个东西要一起改？** 修代码不改 IAM、修 Python 默认值不改 terraform 默认值、修表名不删旧表对象——这些"半修复"在仓库里反复出现过。所以下面四件事尽量一次做完：
+   - 改 writer，同时改 reader
+   - 改代码，同时改 terraform
+   - 改 prod 行为，同时更新文档（PLAN.md / README.md / explanation.md）
+   - 删了某个东西后，grep 全仓确认没有残余引用
+
+第二条特别值得 internalize：**半修复在这个仓库里反复出现过**（DLQ 失败覆盖那次的修复就是个例子，详见早期 commit 5325d09 → 9305514 链）。一次性把对的两边都改了，比修一边等下次再被同样的 gap 咬一次要划算。
 

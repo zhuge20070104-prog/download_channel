@@ -3,7 +3,7 @@
 Glue Batch Job: Dropzone → Bronze S3
 
 每日定时（EventBridge UTC 10:00）或手动触发。
-读取 dropzone 桶中的原始 Parquet 文件（v1 窄表），做:
+读取 dropzone 桶中的原始 Parquet 文件（窄表），做:
   1. 查 DynamoDB checkpoint，确定增量 + restate 分区
   2. 获取并发锁
   3. Schema 校验 + 类型规范化 + 去重
@@ -65,6 +65,7 @@ LOOKBACK_CUTOFF_DT = (
 
 s3_client = boto3.client("s3")
 sns_client = boto3.client("sns")
+glue_client = boto3.client("glue")
 checkpoint = CheckpointManager(
     table_name=args["CHECKPOINT_TABLE"],
     aws_region=args.get("AWS_REGION", "us-east-1"),
@@ -83,6 +84,35 @@ def send_alert(subject: str, message: str):
         )
     except Exception as e:
         print(f"[WARN] Failed to send SNS alert: {e}")
+
+
+def register_bronze_partition(dt: str, store: str):
+    # Best-effort：Athena 是侧路 ad-hoc 通道，注册失败不阻塞 ETL。
+    # AlreadyExistsException 是预期情况（restate 重写、MSCK 已登记过），静默吞。
+    db_name = f"iodp_dc_bronze_{ENVIRONMENT}"
+    table_name = "dc_narrow"
+    location = f"s3://{BRONZE_BUCKET}/download_channel/narrow/dt={dt}/store={store}/"
+    try:
+        glue_client.create_partition(
+            DatabaseName=db_name,
+            TableName=table_name,
+            PartitionInput={
+                "Values": [dt, store],
+                "StorageDescriptor": {
+                    "Location": location,
+                    "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                    "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                    "SerdeInfo": {
+                        "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                    },
+                },
+            },
+        )
+        print(f"[GLUE] Registered Athena partition {dt}/{store}")
+    except glue_client.exceptions.AlreadyExistsException:
+        pass
+    except Exception as e:
+        print(f"[WARN] Failed to register Athena partition {dt}/{store}: {e}")
 
 
 def list_dropzone_partitions():
@@ -234,7 +264,7 @@ def process_partition(dt: str, store: str, keys: list):
 
         # ─── 6. 覆盖写 Bronze ───
         bronze_path = (
-            f"s3://{BRONZE_BUCKET}/download_channel/v1/"
+            f"s3://{BRONZE_BUCKET}/download_channel/narrow/"
             f"dt={dt}/store={store}/"
         )
         # 覆盖写：Spark overwrite 模式会先删旧文件再写新文件
@@ -250,7 +280,10 @@ def process_partition(dt: str, store: str, keys: list):
             f"duration={duration}s"
         )
 
-        # ─── 7. 更新 checkpoint ───
+        # ─── 7. 登记 Athena 分区（best-effort）───
+        register_bronze_partition(dt, store)
+
+        # ─── 8. 更新 checkpoint ───
         checkpoint.release_lock(
             layer, dt, store, status="succeeded",
             in_count=in_count, out_count=out_count,

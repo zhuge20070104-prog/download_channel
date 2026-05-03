@@ -79,6 +79,7 @@ resource "aws_iam_role_policy" "glue_dc_policy" {
           "glue:CreateTable",
           "glue:UpdateTable",
           "glue:GetPartitions",
+          "glue:CreatePartition",
           "glue:BatchCreatePartition",
         ]
         Resource = ["*"]

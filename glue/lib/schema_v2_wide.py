@@ -1,8 +1,8 @@
 # glue/lib/schema_v2_wide.py
 """
-Download Channel 宽表 (v2) Schema 定义
+Download Channel 宽表 Schema 定义
 
-Silver 层统一输出格式：Bronze 的 v1 窄表由 Silver Job pivot 成此 schema。
+Silver 层统一输出格式：Bronze 的窄表由 Silver Job pivot 成此 schema。
 Snowflake 的 SILVER.DC_WIDE 表也基于此 schema + _loaded_at 列。
 """
 
@@ -17,7 +17,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-# 宽表 schema（Bronze v2 / Silver 统一格式）
+# 宽表 schema（Silver 统一格式）
 #
 # 宽表语义：每行 = 一个 (dt, product, store, country, device)，4 个 channel 都被 PIVOT 成列。
 # 比窄表少一行 channel 维度——窄表 4 行在这里塌缩成 1 行。
