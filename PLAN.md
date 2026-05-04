@@ -373,7 +373,7 @@ TASK       IODP_DC_DEDUP_<ENV>                ← 每日去重 task（处理 Sno
 | **Glue Job 失败** | 任一 Job 状态 = FAILED | CloudWatch Alarm on Glue metric | SNS → oncall 邮件/Slack |
 | **DLQ 新增** | `dead_letter/` 下有新文件 | Glue Job 结束时检查 dlq_count > 0 | SNS → oncall |
 | **DLQ 周报** | 每周一汇总 | EventBridge → Lambda → SNS | oncall 邮件 |
-| **Snowpipe 延迟** | `COPY_HISTORY` 最近 2h 无新数据（工作日） | Snowflake Alert | 邮件 |
+| **Snowpipe 延迟** | 当日 (UTC) `COPY_HISTORY` 没有 `PIPE_DC_WIDE` 的 COPY 记录；alert 每天 UTC 13:00 跑一次 | Snowflake Alert | 邮件 |
 | **DynamoDB 锁超时** | `status=running` 且 `lock_expires_at` < 当前时间 | CloudWatch Alarm（自定义 metric，由 Glue Job 上报） | SNS → oncall |
 | **数据缺失** | 某天预期 dropzone 有文件但 Bronze 为空 | EventBridge → Lambda 检查 → SNS | oncall |
 | **DQ 告警** | §12 任一检查不通过 | Glue Job 内 → SNS | oncall |

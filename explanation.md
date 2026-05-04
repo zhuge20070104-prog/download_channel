@@ -2803,3 +2803,241 @@ def register_bronze_partition(dt: str, store: str):
 
 第二条特别值得 internalize：**半修复在这个仓库里反复出现过**（DLQ 失败覆盖那次的修复就是个例子，详见早期 commit 5325d09 → 9305514 链）。一次性把对的两边都改了，比修一边等下次再被同样的 gap 咬一次要划算。
 
+---
+
+## 同一天发现的另一个：Snowpipe freshness alert 把日批当流式
+
+> 接着上面那一连串清理之后，又顺手 review 了一下 Snowflake 侧的 alert SQL。结果发现 `08_freshness_alert.sql` 里的 Snowpipe freshness alert 是**把日批当流式**写的，部署后第一天就会被它的每日误报刷屏。这一节记录这个 bug 怎么暴露的、怎么修的、以及为什么最后选了 daily UTC 13:00 而不是更早。
+
+### 1. 暴露问题的注释
+
+[snowflake_sql/08_freshness_alert.sql](snowflake_sql/08_freshness_alert.sql) 头部原本写：
+
+```sql
+-- 注意:
+--   ACCOUNT_USAGE.COPY_HISTORY 有 ~45 分钟延迟，故检测窗口必须 >= 2h 才有意义。
+--   工作时间窗口（PT 凌晨上游交付 + UTC 10:00 ETL）→ UTC 11:00 后必有数据，故定时 hourly。
+```
+
+实现：
+
+```sql
+SCHEDULE = '60 MINUTE'
+IF (EXISTS (
+  SELECT 1 FROM SNOWFLAKE.ACCOUNT_USAGE.COPY_HISTORY
+  WHERE PIPE_NAME = '...PIPE_DC_WIDE'
+    AND LAST_LOAD_TIME >= DATEADD('hour', -2, CURRENT_TIMESTAMP())
+  HAVING COUNT(*) = 0
+))
+```
+
+逐字翻译：每小时跑一次，如果**最近 2h 没有 COPY** 就告警。
+
+### 2. 这是把流式语义套到日批上
+
+如果是流式 pipeline（比如 iodp 那种 Kafka 24×7 持续 ingest），"最近 2h 没 COPY" 是合理的健康指标：流式管线本来就该 24 小时都有 COPY 活动。
+
+但 Download Channel 是**日批**：每天 UTC 10:00 ETL 触发 → UTC ~11:00 Snowpipe COPY 完成 → **接下来 22 小时一片寂静**，直到第二天 UTC 11:00 新批次到达。
+
+把这个时序套进 alert 条件，会得到下面这张表：
+
+| UTC 时刻 | 距离 last COPY | "最近 2h 有 COPY?" | alert 结果 |
+|---|---|---|---|
+| 11:00 | ~0 min | ✓ | 静默 |
+| 12:00 | 1 h | ✓ | 静默 |
+| 13:00 | 2 h（边界） | 大概 ✓ | 静默（运气） |
+| **14:00** | **3 h** | **✗** | **🔥 alert 触发** |
+| 15:00 | 4 h | ✗ | 🔥 alert 触发 |
+| ... | ... | ... | ... |
+| 09:00 次日 | 22 h | ✗ | 🔥 alert 触发 |
+| 11:00 次日 | 0 min（新批次） | ✓ | 静默 |
+
+也就是 **每天约 21 小时都在告警**，从 UTC 14:00 一直响到第二天 UTC 11:00。部署上线第一天就会被淹没，然后大概率被人 SUSPEND 掉、变成"装饰性 alert"——配置在那里但没人信。
+
+### 3. 修法选择
+
+按日批语义大概有三种思路：
+
+| 方案 | 表达式 | 评价 |
+|---|---|---|
+| (a) 改 schedule 只在窗口跑 | `SCHEDULE = 'USING CRON 0 11,12,13 * * * UTC'`，条件不变 | 治标——错过窗口的失败仍然不告警 |
+| (b) 条件改成"今天还没 COPY" | `WHERE LAST_LOAD_TIME::DATE = CURRENT_DATE` + `daily UTC 13:00` schedule | 业务语义最清晰：今天该到的没到 → 告警 |
+| (c) 条件改成"距离最近 COPY 超过 26h" | `HAVING DATEDIFF('hour', MAX(LAST_LOAD_TIME), now) >= 26` | 不依赖整点 schedule，但 26h 这个魔法数字不直白 |
+
+最后选了 (b)。理由：alert 条件直接表达业务现实（"今天预期有数据，没有 → 异常"），不需要看 schedule 才能理解 alert 在守护什么不变量。
+
+### 4. 时区那个坑：为什么用 SYSDATE() 不用 CURRENT_DATE
+
+简化版（用户最先建议的写法）：
+
+```sql
+WHERE LAST_LOAD_TIME::DATE = CURRENT_DATE
+```
+
+实际写进去的版本：
+
+```sql
+WHERE CONVERT_TIMEZONE('UTC', LAST_LOAD_TIME)::DATE = SYSDATE()::DATE
+```
+
+为什么不直接 `CURRENT_DATE`？因为 **Snowflake 账号默认 `TIMEZONE = America/Los_Angeles`**。`CURRENT_DATE` 在 PT session 里返回的是 PT 日期，不是 UTC 日期。
+
+举个会出问题的例子：
+
+- alert 在 UTC 13:00 跑（= PT 06:00 今天）
+- 上游某天提前到，Snowpipe COPY 发生在 UTC 04:00（= PT 21:00 **昨天**）
+- `LAST_LOAD_TIME::DATE`（按 PT 解释）= 昨天 PT
+- `CURRENT_DATE`（按 PT 解释）= 今天 PT
+- 比较结果 false → **误报**（其实今天的数据已经到了）
+
+`SYSDATE()` 在 Snowflake 里始终返回 **UTC** 的 TIMESTAMP_NTZ，与 session TZ 无关；`CONVERT_TIMEZONE('UTC', LAST_LOAD_TIME)` 把 LTZ 值显式拉到 UTC。两边都锁定在 UTC，无视账号/session 怎么配都跑对。
+
+这种"靠默认值跑对"的代码，在跨账号迁移、CI 跑测试、不同 region 部署时是 landmines。**显式好过隐式**，多打一行 `CONVERT_TIMEZONE` 是值得的。
+
+### 5. 为什么是 daily UTC 13:00 而不是 12:00
+
+13:00 不是随便选的整点，但**也不是必须**——12:00 在大多数日子也能跑对。这一节解释 1 小时 buffer 是给谁留的。
+
+#### 链路上一共有 4 段延迟
+
+| 段 | 来源 | 正常 | 偶尔最坏 |
+|---|---|---|---|
+| ① | Glue Bronze ETL（DPU 启动 + 处理） | 10~15 min | 30~60 min（restate 多分区时） |
+| ② | Glue Silver ETL（pivot + DQ + 写） | 10~15 min | 30~60 min |
+| ③ | S3 ObjectCreated → SNS → Snowpipe → COPY 完成 | <1 min | 几分钟 |
+| ④ | LAST_LOAD_TIME 物化进 ACCOUNT_USAGE.COPY_HISTORY | 5~15 min | **最长 45 min**（Snowflake 文档明确写死的上限） |
+
+ETL 触发是 UTC 10:00。视图里能查到的时刻 = `10:00 + ① + ② + ③ + ④`。
+
+#### 三个具体场景
+
+**场景 A：普通日（数据少，没 restate）**
+
+| 时刻 (UTC) | 事件 |
+|---|---|
+| 10:00 | EventBridge 触发 |
+| 10:10 | Glue Bronze 完成（① = 10 min） |
+| 10:20 | Glue Silver 完成（② = 10 min） |
+| 10:21 | Snowpipe COPY 完成（③ = 1 min） |
+| 10:36 | ACCOUNT_USAGE 物化（④ = 15 min） |
+| **12:00 alert** | ✅ 不告警 |
+| **13:00 alert** | ✅ 不告警 |
+
+→ 普通日 12:00 完全够。
+
+**场景 B：restate 日（7 天 × 2 store = 14 个分区要重写）**
+
+| 时刻 (UTC) | 事件 |
+|---|---|
+| 10:00 | EventBridge 触发 |
+| 10:45 | Glue Bronze 完成（① = 45 min，14 个分区重写慢） |
+| 11:30 | Glue Silver 完成（② = 45 min） |
+| 11:32 | Snowpipe COPY 完成 |
+| **12:15** | ACCOUNT_USAGE 物化（④ = 43 min，接近 45 min 上限） |
+| **12:00 alert** | ❌ **误报**（视图还没物化进来；Snowpipe 其实成功了） |
+| **13:00 alert** | ✅ 不告警 |
+
+→ restate 日 12:00 会误报。
+
+**场景 C：极端慢日（罕见但不是不可能）**
+
+| 时刻 (UTC) | 事件 |
+|---|---|
+| 10:00 | EventBridge 触发 |
+| 11:00 | Glue Bronze 完成（① = 60 min，超大 restate） |
+| 12:00 | Glue Silver 完成（② = 60 min） |
+| 12:05 | Snowpipe COPY 完成 |
+| **12:50** | ACCOUNT_USAGE 物化 |
+| **12:00 alert** | ❌ **误报**（Silver 还在跑） |
+| **13:00 alert** | ✅ 不告警 |
+
+→ 极端慢日 12:00 误报；13:00 刚好够。
+
+#### 为什么不是 12:30
+
+12:30 也能 cover 场景 B。13:00 多出来的 30 分钟有两个边际好处：
+
+1. **整点 cron 表达式干净**——`'USING CRON 0 13 * * * UTC'` 比 `'USING CRON 30 12 * * * UTC'` 一眼好认。
+2. **多出 30 分钟代价几乎 0**——这个 alert 不是 SLA-critical，晚 30 分钟知道"今天没数据"完全可以接受。但少 30 分钟会让场景 C 误报。
+
+**12:00 = 普通日刚好够，restate 日 / 慢日会误报。**
+**13:00 = 把 4 段延迟的"偶尔最坏"全 cover 进去，0 误报。**
+
+### 6. 这次修复的元教训
+
+这个 bug 跟前面三个修复属于同一类，但增加了一个新维度：**抽象套错了语义层**。
+
+前三个 bug 是"业务变了代码没跟上"——很容易识别。这一个是更隐蔽的：**代码看起来合理（流式管线常见的 freshness 检查模式），但套到日批 pipeline 上语义就反了**。
+
+判断这种 bug 的窍门：**问"这个检查在 24 小时里有几个小时是 true"**。
+
+- 流式 pipeline 上 "最近 2h 没 COPY"：true 出现的时刻 = 真出故障的时刻（罕见）→ 高信号
+- 日批 pipeline 上 "最近 2h 没 COPY"：true 出现的时刻 = 每天大部分时间（21/24 小时）→ 几乎全是噪音
+
+一个 alert 如果 "正常情况下大部分时间都是 true"，它在设计上就有问题——不管它的 schedule 多频繁、邮件文案多漂亮。**Alert 的本质是异常信号，正常态必须 false。**
+
+---
+
+## `apply_athena_ddl.sh` 的 `ACCOUNT_ID` 是什么
+
+[scripts/apply_athena_ddl.sh:8](scripts/apply_athena_ddl.sh#L8) 把 `ACCOUNT_ID` 当第二个位置参数收进来：
+
+```bash
+ACCOUNT_ID="${2:?Usage: $0 <ENVIRONMENT> <AWS_ACCOUNT_ID> [AWS_REGION]}"
+```
+
+这就是 **AWS 12 位账号数字**（比如 `123456789012`），不是 IAM user/role 名、也不是任何 alias。
+
+### 在脚本里的两个用途
+
+1. **拼 Athena 查询输出桶**（[apply_athena_ddl.sh:13](scripts/apply_athena_ddl.sh#L13)）：
+
+   ```bash
+   OUTPUT_LOC="s3://iodp-dc-bronze-${ENVIRONMENT}-${ACCOUNT_ID}/athena-results/"
+   ```
+
+   Athena 跑每条 query 都需要一个 S3 路径写结果（即使是 DDL 也会写一个空结果文件）。这里复用了 Bronze 桶下的 `athena-results/` 子目录。
+
+2. **替换 DDL 文件里的 `${ACCOUNT_ID}` 占位符**（[apply_athena_ddl.sh:22-24](scripts/apply_athena_ddl.sh#L22-L24)）：
+
+   ```bash
+   rendered=$(sed \
+       -e "s/\${ENVIRONMENT}/${ENVIRONMENT}/g" \
+       -e "s/\${ACCOUNT_ID}/${ACCOUNT_ID}/g" \
+       "${ddl_file}")
+   ```
+
+   比如 [athena_ddl/bronze_dc_narrow.sql:17](athena_ddl/bronze_dc_narrow.sql#L17) 里写的是：
+
+   ```sql
+   LOCATION 's3://iodp-dc-bronze-${ENVIRONMENT}-${ACCOUNT_ID}/download_channel/narrow/'
+   ```
+
+   `sed` 把两个占位符替换成实际值后再丢给 Athena CLI。
+
+### 为什么桶名要带 account ID
+
+S3 bucket 名字是**全球唯一**的命名空间——不只是你的账号唯一，是**全球所有 AWS 用户共享一个命名空间**。如果只叫 `iodp-dc-bronze-prod`，第一个建桶的人占住名字之后，全世界其他人都建不了同名桶。
+
+iodp 项目的命名约定是 `<service>-<env>-<account-id>`，靠 12 位 account ID 保证唯一性、同时让运维一眼能看出桶属于哪个账号（cross-account 排查时特别有用）。
+
+### 怎么查当前 account ID
+
+```bash
+aws sts get-caller-identity --query Account --output text
+```
+
+`sts:GetCallerIdentity` 是个零权限 API（任何 IAM 主体都能调），不需要专门的 policy。
+
+### 调用脚本
+
+```bash
+# 形式
+./scripts/apply_athena_ddl.sh <ENVIRONMENT> <AWS_ACCOUNT_ID> [AWS_REGION]
+
+# 例子
+./scripts/apply_athena_ddl.sh dev 123456789012 us-east-1
+```
+
+第三个参数 region 可省，默认 `us-east-1`（[apply_athena_ddl.sh:9](scripts/apply_athena_ddl.sh#L9)）。
+

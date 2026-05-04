@@ -244,7 +244,7 @@ All alerts publish to a single SNS topic (`iodp-dc-alerts-<env>`) subscribed to 
 | 1 | Glue Job failure | `numFailedTasks ≥ 1` | CloudWatch Alarm per Glue job → SNS |
 | 2 | DLQ new files | `dlq_count > 0` after a Glue run | Inline `send_alert()` in `bronze_etl.py` / `silver_etl.py` |
 | 3 | DLQ weekly report | Mondays 09:00 UTC | `lambda/dlq_weekly_report/` via EventBridge cron |
-| 4 | Snowpipe silent ≥ 2h | `COPY_HISTORY` empty for `PIPE_DC_WIDE` | Snowflake `ALERT IODP_DC_SNOWPIPE_FRESHNESS_<ENV>` (hourly) |
+| 4 | Snowpipe missed today | No `COPY_HISTORY` row for `PIPE_DC_WIDE` with `LAST_LOAD_TIME` in today (UTC) | Snowflake `ALERT IODP_DC_SNOWPIPE_FRESHNESS_<ENV>` (daily UTC 13:00) |
 | 5 | Stale DynamoDB lock | `status=running AND lock_expires_at < now` | `lambda/stale_lock_check/` every 30 min |
 | 6 | Upstream data missing | No files under expected `dt=today` partitions | `lambda/dropzone_freshness_check/` daily 11:00 UTC (1h after ETL) |
 | 7 | DQ check failure | Any blocking DQ check fails | Inline `send_alert()` in `silver_etl.py` |

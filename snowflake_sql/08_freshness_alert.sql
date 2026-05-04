@@ -4,11 +4,16 @@
 -- 检测原理:
 --   Snowpipe 把 Silver S3 的 Parquet COPY 进 SILVER.DC_WIDE。
 --   ACCOUNT_USAGE.COPY_HISTORY 记录每次 COPY 的时间。
---   如果最近 N 小时一次都没 COPY 过 → Pipe 卡了/没收到 SNS 事件/IAM 失效，必须告警。
+--   每天 UTC 13:00 检查"今天 (UTC) 是否已经 COPY 过"——没有则
+--   Pipe 卡了/没收到 SNS 事件/IAM 失效/上游 Glue Workflow 没产出文件，必须告警。
 --
 -- 注意:
---   ACCOUNT_USAGE.COPY_HISTORY 有 ~45 分钟延迟，故检测窗口必须 >= 2h 才有意义。
---   工作时间窗口（PT 凌晨上游交付 + UTC 10:00 ETL）→ UTC 11:00 后必有数据，故定时 hourly。
+--   ACCOUNT_USAGE.COPY_HISTORY 有 ~45 分钟延迟，所以 alert 必须在每日批次落地后留足 buffer。
+--   日批时序: PT 凌晨上游交付 + UTC 10:00 ETL → UTC ~11:00 Snowpipe COPY 完成。
+--   语义: 每天 UTC 13:00 跑一次（已留 ~2h buffer 等 ACCOUNT_USAGE 物化），
+--         检查"今天 (UTC) 是否已经有过 COPY"，没有则告警。
+--   不用 hourly + "最近 2h 没 COPY" 模式，因为日批语境下 2h 窗口外没 COPY 是正常的，
+--   会每天误报 ~21 小时。
 
 USE DATABASE IODP_DC_${ENV};
 
@@ -30,18 +35,21 @@ CREATE OR REPLACE NOTIFICATION INTEGRATION IODP_DC_EMAIL_NOTIF_${ENV}
   COMMENT            = 'Email integration for Download Channel ETL alerts';
 
 -- ════════════════════════════════════════════════════════════════
---  Alert: Snowpipe 静默 (无新 COPY 超过 2 小时)
+--  Alert: Snowpipe 静默 (今天 UTC 还没 COPY 过)
 -- ════════════════════════════════════════════════════════════════
 
 CREATE OR REPLACE ALERT IODP_DC_SNOWPIPE_FRESHNESS_${ENV}
   WAREHOUSE = COMPUTE_WH_DC_${ENV}
-  SCHEDULE  = '60 MINUTE'
-  COMMENT   = 'Alerts when Snowpipe has not loaded any Silver file in the last 2h'
+  SCHEDULE  = 'USING CRON 0 13 * * * UTC'
+  COMMENT   = 'Daily check at UTC 13:00; alerts if today (UTC) has no Snowpipe COPY into PIPE_DC_WIDE yet'
 IF (EXISTS (
+  -- LAST_LOAD_TIME 是 TIMESTAMP_LTZ；显式 CONVERT_TIMEZONE 到 UTC 后取 DATE，
+  -- 避免依赖 session TIMEZONE 默认值（Snowflake 默认 America/Los_Angeles）。
+  -- SYSDATE() 始终返回 UTC NTZ，::DATE 即"今天 UTC 的日期"。
   SELECT 1
   FROM SNOWFLAKE.ACCOUNT_USAGE.COPY_HISTORY
   WHERE PIPE_NAME = 'IODP_DC_${ENV}.RAW_STAGE.PIPE_DC_WIDE'
-    AND LAST_LOAD_TIME >= DATEADD('hour', -2, CURRENT_TIMESTAMP())
+    AND CONVERT_TIMEZONE('UTC', LAST_LOAD_TIME)::DATE = SYSDATE()::DATE
   HAVING COUNT(*) = 0
 ))
 THEN
@@ -49,9 +57,11 @@ THEN
     'IODP_DC_EMAIL_NOTIF_${ENV}',
     '${ALERT_EMAIL}',
     '[DC-ETL] Snowpipe freshness alert (${ENV})',
-    'Snowpipe IODP_DC_${ENV}.RAW_STAGE.PIPE_DC_WIDE has not loaded any file in the past 2 hours. ' ||
+    'Snowpipe IODP_DC_${ENV}.RAW_STAGE.PIPE_DC_WIDE has not loaded any file today (UTC). ' ||
+    'Expected daily load completes by UTC ~11:00; this alert ran at UTC 13:00 and found no COPY events for today. ' ||
     'Investigate: (1) S3 SNS notification on silver bucket; (2) Storage Integration trust policy; ' ||
-    '(3) Pipe status via SYSTEM$PIPE_STATUS(''IODP_DC_${ENV}.RAW_STAGE.PIPE_DC_WIDE'').'
+    '(3) Pipe status via SYSTEM$PIPE_STATUS(''IODP_DC_${ENV}.RAW_STAGE.PIPE_DC_WIDE''); ' ||
+    '(4) Glue Bronze/Silver Workflow run history (upstream may have not produced files).'
   );
 
 ALTER ALERT IODP_DC_SNOWPIPE_FRESHNESS_${ENV} RESUME;
