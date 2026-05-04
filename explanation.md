@@ -1451,6 +1451,106 @@ Resource = [var.checkpoint_status_index_arn]        # 之前: 主表 ARN
 
 `projection_type = "INCLUDE"` 是个 GSI 优化项：告诉 DynamoDB GSI 里除了 PK/SK 还要冗余存哪几列。Lambda 告警邮件需要 `partition_key, last_processed_at, job_run_id`，所以这 3 列也存进 GSI 一份；如果用 `KEYS_ONLY`，Lambda Query 完拿不到这些字段，还得回主表 GetItem，徒增 RCU。
 
+### GSI 四个字段逐个看（hash_key / range_key / projection_type / non_key_attributes）
+
+GSI（Global Secondary Index）可以理解成 **「DynamoDB 给同一张表额外开的一份小表，按不同的 key 重新组织数据，方便快速查询」**。主表 PK 是 `partition_key`（如 `bronze#2026-04-25#ios`），适合"按某个分区查它的 checkpoint"；但 stale-lock Lambda 想问的是另一个问题：**"现在有哪些 Job 还在 running 状态、且锁过期了？"**——拿主表查就得 Scan 全表，越来越贵。所以建这个 GSI，让它能用 Query 直接定位。
+
+四个字段的角色一览：
+
+| 字段 | 作用 | 在这里填什么 |
+|---|---|---|
+| `hash_key` | GSI 的**分区键**（必填）—— 决定数据物理上分到哪个 partition | `status` |
+| `range_key` | GSI 的**排序键**（可选）—— 同一个分区内按它排序，可以做范围查询 | `lock_expires_at` |
+| `projection_type` | **投影类型** —— 决定 GSI 上能直接读到哪些字段 | `INCLUDE`（除 key 外，再额外带几个） |
+| `non_key_attributes` | 当 `projection_type=INCLUDE` 时，列出**还要顺便带哪些字段** | `partition_key`、`last_processed_at`、`job_run_id` |
+
+#### 1. `hash_key = "status"` —— 分区键
+
+GSI 把数据按 `status` 字段的值**重新分桶**。
+
+这个项目里 `status` 只有一个值 `"running"`（Job 完成时这个字段会被 `REMOVE`，所以 GSI 是**稀疏的**——只有"正在跑的 Job"的那几行才会出现在索引里）。
+
+**举例**：主表里有 100 万行历史 checkpoint，但此刻只有 3 个 Job 在跑。GSI 里就只有 3 行。Lambda `Query("status = running")` 直接拿到这 3 行，不会扫到那 100 万行。
+
+> ⚠️ DynamoDB 的"稀疏索引"性质：**只有写入了 hash_key 字段的 item 才会进 GSI**。`UpdateItem ... REMOVE status` 之后，那一行就从 GSI 里消失了。这是这个设计的核心。
+
+#### 2. `range_key = "lock_expires_at"` —— 排序键
+
+同一个分区（`status="running"`）内的 item 按 `lock_expires_at` 字段排序。
+
+**举例**：当前 3 个 running 的 Job，Lambda 在 13:00 跑去找过期锁：
+
+| partition_key | status | lock_expires_at |
+|---|---|---|
+| `bronze#2026-05-01#ios` | running | `2026-05-04T10:00:00Z` ← 已过期 |
+| `bronze#2026-05-02#android` | running | `2026-05-04T11:30:00Z` ← 已过期 |
+| `silver#2026-05-03#ios` | running | `2026-05-04T14:00:00Z` ← 还没过期 |
+
+```python
+table.query(
+    IndexName="status-index",
+    KeyConditionExpression=Key("status").eq("running") & Key("lock_expires_at").lt("2026-05-04T13:00:00Z"),
+)
+```
+
+DynamoDB 直接定位到 `status="running"` 这个分区，沿着 `lock_expires_at` 升序往下扫，**只读到前两行就停**（第三行 14:00 > 13:00 不满足）。这就是 range_key 带来的"范围查询能省钱"。
+
+如果没有 range_key、只有 hash_key，就得把 3 行全读回来再在客户端过滤。
+
+#### 3. `projection_type = "INCLUDE"` —— 投影类型
+
+GSI 物理上是另一张「小表」，存什么字段是可以选的。三种选择：
+
+| 类型 | 存什么 | 优劣 |
+|---|---|---|
+| `KEYS_ONLY` | 只存主表 PK + GSI 的 hash/range key | 最便宜，但读到结果还得回主表查详情 |
+| `INCLUDE` | KEYS_ONLY + 你指定的几个额外字段 | **折中**：常用字段直接从 GSI 拿，不常用的回主表 |
+| `ALL` | 主表所有字段都拷一份 | 读最方便，但写放大 + 存储成本最高 |
+
+这里选 `INCLUDE` —— 表示"我知道 Lambda 处理 stale lock 时只用得上几个特定字段，没必要把所有字段都拷过来"。
+
+**为什么不用 `ALL`？** 主表里还有 `file_md5s`（文件指纹列表，可能很大）、`last_status`、`TTL` 等字段，Lambda 处理 stale lock 时根本用不上。`INCLUDE` 让 GSI 物理体积更小、写放大更小、更便宜。
+
+**为什么不用 `KEYS_ONLY`？** Lambda 拿到锁后还需要 `partition_key`（用来定位主表行）、`last_processed_at`（日志里写"上次处理到哪"）、`job_run_id`（日志里写"卡死的是哪个 Glue run"）。如果用 KEYS_ONLY 还得多一次主表读取，徒增 RCU。
+
+#### 4. `non_key_attributes = [...]` —— 投影哪些非 key 字段
+
+只有在 `projection_type=INCLUDE` 时才需要填。这里指定了 3 个：
+
+| 字段 | 用途 |
+|---|---|
+| `partition_key` | 主表的 hash key —— Lambda 拿到锁后要 `UpdateItem({partition_key: ...})` 去主表把 status REMOVE 掉，**没这个就找不到主表那一行** |
+| `last_processed_at` | 上次处理到哪（用于打日志、debug） |
+| `job_run_id` | 卡死的 Glue Job Run ID（用于打日志，便于在 AWS Console 找对应的 Glue 失败记录） |
+
+> 注意：`status` 和 `lock_expires_at` **不需要列在这里**，因为它俩是 GSI 自己的 hash_key + range_key，DynamoDB 自动会带上。
+
+#### 一图看清主表 vs GSI 的关系
+
+```
+主表（按 partition_key 分布，1M 行）
+┌───────────────────────────────┬─────────┬────────────────┬──────────────┐
+│ partition_key                 │ status  │ lock_expires_at │ ...其他字段  │
+├───────────────────────────────┼─────────┼────────────────┼──────────────┤
+│ bronze#2026-05-01#ios         │ running │ 10:00          │ file_md5s,...│
+│ bronze#2026-05-02#android     │ running │ 11:30          │ file_md5s,...│
+│ silver#2026-05-03#ios         │ running │ 14:00          │ file_md5s,...│
+│ bronze#2026-04-30#ios         │ (无)    │ (无)           │ last_status= │
+│ ... 100 万行历史 (无 status)  │         │                │ "succeeded"  │
+└───────────────────────────────┴─────────┴────────────────┴──────────────┘
+
+GSI status-index (按 status 分布，只 3 行 — 稀疏!)
+┌─────────┬────────────────┬────────────────────────┬─────────────────┬────────────┐
+│ status  │ lock_expires_at│ partition_key          │ last_processed  │ job_run_id │
+│ (HASH)  │ (RANGE)        │ (INCLUDE)              │ _at (INCLUDE)   │ (INCLUDE)  │
+├─────────┼────────────────┼────────────────────────┼─────────────────┼────────────┤
+│ running │ 10:00          │ bronze#2026-05-01#ios  │ 09:55           │ jr_abc     │
+│ running │ 11:30          │ bronze#2026-05-02#and..│ 11:25           │ jr_def     │
+│ running │ 14:00          │ silver#2026-05-03#ios  │ 13:50           │ jr_ghi     │
+└─────────┴────────────────┴────────────────────────┴─────────────────┴────────────┘
+                                                  ↑ Lambda 想要的字段都在这里，不用回主表
+```
+
 ### 端到端追踪：一个分区的完整生命周期
 
 跟踪 `(layer=bronze, dt=2026-04-25, store=ios)` 这条 item 在新设计下的状态变化：

@@ -1,23 +1,24 @@
 # terraform/environments/dev.tfvars
 
 environment    = "dev"
-aws_region     = "us-east-1"
-aws_account_id = "123456789012"  # TODO: replace with actual account ID
+aws_region     = "ap-southeast-1"
+aws_account_id = "165518479671"
 
 cost_center = "engineering-data-platform"
-team_owner  = "data-engineering@company.com"
+team_owner  = "fredric2010@outlook.com"
 
 # Networking
 vpc_cidr           = "10.2.0.0/16"
-availability_zones = ["us-east-1a", "us-east-1b"]
+availability_zones = ["ap-southeast-1a", "ap-southeast-1b"]
 
 # External
-dropzone_bucket_name = "dataai-dropzone-dev-123456789012"  # TODO: replace
+dropzone_bucket_name = "dataai-dropzone-dev-165518479671"  # TODO: replace
 
 # Observability
-alarm_email = "data-engineering-dev@company.com"  # TODO: replace
+alarm_email = "fredric2010@outlook.com"  
 
 # Snowflake
+# TODO: 这个account的话，需要到snowflake 网站上去申请。
 snowflake_account   = "xy12345.us-east-1"  # TODO: replace
 snowflake_user      = "TERRAFORM_SVC_DEV"  # TODO: replace
 snowflake_role      = "ACCOUNTADMIN"
