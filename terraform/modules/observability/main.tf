@@ -16,29 +16,57 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 # ════════════════════════════════════════════════════════════════
-#  Glue Job Failure Alarms
+#  Glue Job Failure Alerts (EventBridge — Job State Change)
+#  监听 job 终态事件 (FAILED/TIMEOUT/ERROR)，而非 task 级 numFailedTasks。
+#  原因：task retry 成功 (常见于瞬时 OOM / 节点抖动) 会污染 numFailedTasks，
+#  即使 Job 整体 SUCCEEDED 也会触发 task 级告警，产生误报。
 # ════════════════════════════════════════════════════════════════
 
-resource "aws_cloudwatch_metric_alarm" "glue_job_failure" {
-  for_each = toset(var.glue_job_names)
+resource "aws_cloudwatch_event_rule" "glue_job_failed" {
+  name        = "iodp-dc-glue-job-failed-${var.environment}"
+  description = "Catch Glue job terminal failures (FAILED/TIMEOUT/ERROR)"
 
-  alarm_name          = "iodp-dc-${each.value}-failure-${var.environment}"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "glue.driver.aggregate.numFailedTasks"
-  namespace           = "Glue"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 1
-  alarm_description   = "Glue job ${each.value} has failed tasks"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
+  event_pattern = jsonencode({
+    source        = ["aws.glue"]
+    "detail-type" = ["Glue Job State Change"]
+    detail = {
+      jobName = var.glue_job_names
+      state   = ["FAILED", "TIMEOUT", "ERROR"]
+    }
+  })
 
-  dimensions = {
-    JobName = each.value
-    Type    = "gauge"
+  state = var.triggers_enabled ? "ENABLED" : "DISABLED"
+  tags  = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "glue_job_failed_sns" {
+  rule = aws_cloudwatch_event_rule.glue_job_failed.name
+  arn  = aws_sns_topic.alerts.arn
+
+  input_transformer {
+    input_paths = {
+      job   = "$.detail.jobName"
+      state = "$.detail.state"
+      runId = "$.detail.jobRunId"
+      msg   = "$.detail.message"
+    }
+    input_template = "\"Glue job <job> ended in state <state>. RunId=<runId>. Message=<msg>\""
   }
+}
 
-  tags = var.tags
+resource "aws_sns_topic_policy" "alerts_allow_events" {
+  arn = aws_sns_topic.alerts.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowEventBridgePublish"
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sns:Publish"
+      Resource  = aws_sns_topic.alerts.arn
+    }]
+  })
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -386,7 +414,7 @@ resource "aws_cloudwatch_dashboard" "dc_etl" {
           metrics = [for name in var.glue_job_names : ["Glue", "glue.driver.aggregate.elapsedTime", "JobName", name, "Type", "gauge"]]
           period  = 86400
           stat    = "Average"
-          region  = "us-east-1"
+          region  = var.aws_region
         }
       },
       {
@@ -400,7 +428,7 @@ resource "aws_cloudwatch_dashboard" "dc_etl" {
           metrics = [for name in var.glue_job_names : ["Glue", "glue.driver.aggregate.numFailedTasks", "JobName", name, "Type", "gauge"]]
           period  = 86400
           stat    = "Sum"
-          region  = "us-east-1"
+          region  = var.aws_region
         }
       },
     ]

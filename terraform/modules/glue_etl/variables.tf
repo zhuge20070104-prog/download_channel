@@ -44,10 +44,6 @@ variable "sns_alert_topic_arn" {
   type = string
 }
 
-variable "glue_catalog_id" {
-  type = string
-}
-
 variable "triggers_enabled" {
   type    = bool
   default = true

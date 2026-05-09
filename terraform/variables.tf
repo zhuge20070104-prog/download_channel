@@ -1,9 +1,8 @@
 # terraform/variables.tf
 
 variable "aws_region" {
-  description = "AWS region for all resources"
+  description = "AWS region for all resources. No default — every env must set this in tfvars to avoid silently picking us-east-1."
   type        = string
-  default     = "us-east-1"
 }
 
 variable "aws_account_id" {
@@ -41,9 +40,8 @@ variable "vpc_cidr" {
 }
 
 variable "availability_zones" {
-  description = "AZs for subnet deployment"
+  description = "AZs for subnet deployment. No default — must match aws_region; every env must set this in tfvars."
   type        = list(string)
-  default     = ["us-east-1a", "us-east-1b"]
 }
 
 # ─── External ───

@@ -4,6 +4,11 @@ variable "environment" {
   type = string
 }
 
+variable "aws_region" {
+  description = "AWS region used by the dashboard widgets to query metrics"
+  type        = string
+}
+
 variable "glue_job_names" {
   description = "List of Glue job names to monitor"
   type        = list(string)

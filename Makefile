@@ -59,7 +59,7 @@ init: check-tools check-aws check-snowflake upload-glue-scripts deploy-infra-pha
 
 .PHONY: deploy-infra-phase1
 deploy-infra-phase1: ## Phase 1: TF apply (infra + Snowflake, no triggers)
-	cd $(TF_DIR) && terraform init && terraform apply \
+	cd $(TF_DIR) && terraform init -reconfigure -backend-config=environments/backend-$(ENV).hcl && terraform apply \
 		$(TF_VARS) \
 		-var='triggers_enabled=false' \
 		-target=module.networking \
@@ -89,7 +89,7 @@ apply-athena-ddl: ## Register Athena tables
 
 .PHONY: deploy
 deploy: ## Everyday update: full terraform apply
-	cd $(TF_DIR) && terraform init && terraform apply $(TF_VARS)
+	cd $(TF_DIR) && terraform init -reconfigure -backend-config=environments/backend-$(ENV).hcl && terraform apply $(TF_VARS)
 
 # ════════════════════════════════════════════════════════════════
 #  Manual ETL Triggers

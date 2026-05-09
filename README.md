@@ -241,7 +241,7 @@ All alerts publish to a single SNS topic (`iodp-dc-alerts-<env>`) subscribed to 
 
 | # | Alert | Trigger | Implementation |
 |---|-------|---------|---------------|
-| 1 | Glue Job failure | `numFailedTasks ≥ 1` | CloudWatch Alarm per Glue job → SNS |
+| 1 | Glue Job failure | Glue Job State Change event with state ∈ {FAILED, TIMEOUT, ERROR} | EventBridge rule → SNS (job-level, not task-level) |
 | 2 | DLQ new files | `dlq_count > 0` after a Glue run | Inline `send_alert()` in `bronze_etl.py` / `silver_etl.py` |
 | 3 | DLQ weekly report | Mondays 09:00 UTC | `lambda/dlq_weekly_report/` via EventBridge cron |
 | 4 | Snowpipe missed today | No `COPY_HISTORY` row for `PIPE_DC_WIDE` with `LAST_LOAD_TIME` in today (UTC) | Snowflake `ALERT IODP_DC_SNOWPIPE_FRESHNESS_<ENV>` (daily UTC 13:00) |

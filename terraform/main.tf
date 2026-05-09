@@ -29,8 +29,6 @@ provider "snowflake" {
   warehouse = var.snowflake_warehouse
 }
 
-data "aws_caller_identity" "current" {}
-
 # ════════════════════════════════════════════════════════════════
 #  Core Infrastructure
 # ════════════════════════════════════════════════════════════════
@@ -78,6 +76,7 @@ module "observability" {
   source = "./modules/observability"
 
   environment = var.environment
+  aws_region  = var.aws_region
   # Use predictable job names to break circular dependency with glue_etl
   glue_job_names = [
     "iodp-dc-bronze-etl-${var.environment}",
@@ -113,7 +112,6 @@ module "glue_etl" {
   checkpoint_table_name = module.dynamodb.checkpoint_table_name
   checkpoint_table_arn  = module.dynamodb.checkpoint_table_arn
   sns_alert_topic_arn   = module.observability.sns_alert_topic_arn
-  glue_catalog_id       = data.aws_caller_identity.current.account_id
   triggers_enabled      = var.triggers_enabled
   glue_dpu              = var.glue_dpu_standard
   glue_timeout_minutes  = var.glue_timeout_minutes
@@ -129,6 +127,20 @@ module "glue_dlq_replay" {
   bronze_bucket_name       = module.storage.bronze_bucket_name
   dropzone_bucket_name     = var.dropzone_bucket_name
   tags                     = local.mandatory_tags
+}
+
+# ════════════════════════════════════════════════════════════════
+#  Dropzone Seeder (demo / test data generator — non-prod use)
+# ════════════════════════════════════════════════════════════════
+
+module "dropzone_seeder" {
+  source = "./modules/dropzone_seeder"
+
+  environment          = var.environment
+  dropzone_bucket_name = var.dropzone_bucket_name
+  scripts_bucket_name  = module.storage.scripts_bucket_name
+  scripts_bucket_arn   = module.storage.scripts_bucket_arn
+  tags                 = local.mandatory_tags
 }
 
 # ════════════════════════════════════════════════════════════════
