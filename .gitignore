@@ -1,3 +1,7 @@
 iodp
 trtllm-ci
 word2pdf
+
+# Terraform local config — real values live here, only *.example is committed
+terraform/environments/*.tfvars
+!terraform/environments/*.tfvars.example

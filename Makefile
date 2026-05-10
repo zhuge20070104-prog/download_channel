@@ -155,6 +155,53 @@ dlq-replay: ## Replay all DLQ files from a given failure day: make dlq-replay DA
 	@echo "DLQ replay job started for failed_at=$(DATE)"
 
 # ════════════════════════════════════════════════════════════════
+#  Snowpipe DLQ (delivery-level failures only — see explanation.md)
+# ════════════════════════════════════════════════════════════════
+# Note: COPY-level failures (schema/parse errors) are NOT here — they go to
+# Snowflake's COPY_HISTORY view. This DLQ catches messages Snowpipe failed
+# to ack after maxReceiveCount=5 (Snowpipe slow / stuck / IAM issues).
+
+.PHONY: snowpipe-dlq-status
+snowpipe-dlq-status: ## Show Snowpipe DLQ message counts
+	@QUEUE_URL=$$(cd $(TF_DIR) && terraform output -raw snowpipe_dlq_url 2>/dev/null) || { echo "ERROR: snowpipe_dlq_url output unavailable — run 'make deploy' first"; exit 1; }; \
+	aws sqs get-queue-attributes \
+		--queue-url "$$QUEUE_URL" \
+		--attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible ApproximateAgeOfOldestMessage \
+		--region $(AWS_REGION) \
+		--output table
+
+.PHONY: snowpipe-dlq-peek
+snowpipe-dlq-peek: ## Peek at one DLQ message without consuming it
+	@QUEUE_URL=$$(cd $(TF_DIR) && terraform output -raw snowpipe_dlq_url 2>/dev/null) || { echo "ERROR: snowpipe_dlq_url output unavailable"; exit 1; }; \
+	aws sqs receive-message \
+		--queue-url "$$QUEUE_URL" \
+		--max-number-of-messages 1 \
+		--visibility-timeout 1 \
+		--region $(AWS_REGION)
+
+.PHONY: snowpipe-dlq-redrive
+snowpipe-dlq-redrive: ## Move all DLQ messages back to main Snowpipe queue (AWS-native StartMessageMoveTask)
+	@DLQ_ARN=$$(cd $(TF_DIR) && terraform output -raw snowpipe_dlq_arn 2>/dev/null) || { echo "ERROR: snowpipe_dlq_arn output unavailable"; exit 1; }; \
+	echo "Starting message move task: $$DLQ_ARN -> main queue (default destination)"; \
+	aws sqs start-message-move-task \
+		--source-arn "$$DLQ_ARN" \
+		--region $(AWS_REGION); \
+	echo "Move task started. Check status with: make snowpipe-dlq-redrive-status ENV=$(ENV)"
+
+.PHONY: snowpipe-dlq-redrive-status
+snowpipe-dlq-redrive-status: ## Show in-flight / recent redrive tasks for the DLQ
+	@DLQ_ARN=$$(cd $(TF_DIR) && terraform output -raw snowpipe_dlq_arn 2>/dev/null) || { echo "ERROR: snowpipe_dlq_arn output unavailable"; exit 1; }; \
+	aws sqs list-message-move-tasks \
+		--source-arn "$$DLQ_ARN" \
+		--region $(AWS_REGION) \
+		--output table
+
+.PHONY: snowpipe-dlq-redrive-cancel
+snowpipe-dlq-redrive-cancel: ## Cancel an in-flight redrive: pass HANDLE=<task-handle from snowpipe-dlq-redrive-status>
+	@test -n "$(HANDLE)" || { echo "ERROR: HANDLE=<task-handle> required (get from snowpipe-dlq-redrive-status)"; exit 1; }
+	aws sqs cancel-message-move-task --task-handle "$(HANDLE)" --region $(AWS_REGION)
+
+# ════════════════════════════════════════════════════════════════
 #  Status & Info
 # ════════════════════════════════════════════════════════════════
 

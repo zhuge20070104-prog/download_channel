@@ -166,6 +166,7 @@ module "snowpipe" {
   silver_sns_topic_arn    = module.storage.silver_sns_topic_arn
   snowflake_iam_user_arn  = module.snowflake.storage_aws_iam_user_arn
   snowflake_external_id   = module.snowflake.storage_aws_external_id
+  sns_alert_topic_arn     = module.observability.sns_alert_topic_arn
   tags                    = local.mandatory_tags
 }
 

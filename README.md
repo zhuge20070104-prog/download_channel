@@ -93,22 +93,68 @@ download_channel/
 └── README.md                      # This file
 ```
 
-## Quick Start
+## Initial Setup (one-time, before first deploy)
+
+These five steps must be done once per environment before `make init`. They are intentionally not automated because they involve resources outside this stack: an upstream-owned bucket, a Snowflake account, and email verification.
+
+### 1. Copy the tfvars template
+
+`*.tfvars` files are gitignored — only `*.tfvars.example` templates are committed. Create your local copy:
 
 ```bash
-# 1. Set environment variables
+cp terraform/environments/dev.tfvars.example terraform/environments/dev.tfvars
+```
+
+### 2. Fill in placeholders in `dev.tfvars`
+
+Open the file and replace every `<YOUR_*>` placeholder:
+
+| Placeholder | What to put |
+|---|---|
+| `<YOUR_AWS_ACCOUNT_ID>` (twice) | Your 12-digit AWS account ID — get via `aws sts get-caller-identity --query Account --output text` |
+| `<YOUR_EMAIL>` (twice) | Email for `team_owner` and `alarm_email`. **`alarm_email` must match the verified Snowflake user email in step 4.** |
+| `<YOUR_SNOWFLAKE_ACCOUNT>` | Your Snowflake account locator (e.g. `xy12345.us-east-1`) — see step 4 |
+
+The `dropzone_bucket_name` follows the convention `dataai-dropzone-dev-<YOUR_AWS_ACCOUNT_ID>` — keep that pattern when filling in.
+
+### 3. Create the upstream dropzone bucket
+
+In production this bucket is owned by Data.ai (the upstream provider) and Terraform deliberately does not manage it (see `terraform/variables.tf` — variable `dropzone_bucket_name` is in the `# ─── External ───` section). For demo, create it yourself:
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+aws s3 mb "s3://dataai-dropzone-dev-${ACCOUNT_ID}" --region ap-southeast-1
+```
+
+If you skip this, `terraform apply` succeeds (the ARN is interpolated, not data-sourced) but Glue jobs will hit AccessDenied at runtime against a non-existent bucket — confusing failure mode.
+
+### 4. Set up Snowflake (account + user + email verification)
+
+If you don't have a Snowflake account, register a free trial at https://signup.snowflake.com — the account locator (e.g. `xy12345.us-east-1`) goes into `dev.tfvars` as `snowflake_account`.
+
+Then bind a verified email to a Snowflake user and click the verification link Snowflake mails you — see [One-time Setup: Snowflake User Email for Alerts](#one-time-setup-snowflake-user-email-for-alerts) below for the exact SQL. The email you bind here **must equal** `alarm_email` in `dev.tfvars`, otherwise alerts silently fail.
+
+### 5. Export secrets as environment variables
+
+The Snowflake password is `sensitive = true` in Terraform and never lives in `*.tfvars`. Export the env vars listed in [Environment Variables](#environment-variables) — at minimum:
+
+```bash
 export AWS_PROFILE=your-profile
-export SNOWFLAKE_USER=your_user
-export SNOWFLAKE_PASSWORD=your_password
+export SNOWFLAKE_USER=...
+export SNOWFLAKE_PASSWORD=...
 export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+export TF_VAR_snowflake_password="${SNOWFLAKE_PASSWORD}"   # Terraform reads this; provider doesn't auto-pick SNOWFLAKE_PASSWORD
+```
 
-# 2. Edit terraform/environments/dev.tfvars with your account ID
+Add these to your shell profile (or a `.envrc` if you use direnv) so they persist across sessions.
 
-# 3. Full deploy (6 phases)
-make init ENV=dev
+---
 
-# 4. Verify — manual trigger
-make run-etl ENV=dev
+## Quick Start (after Initial Setup)
+
+```bash
+make init ENV=dev          # Full 6-phase deploy
+make run-etl ENV=dev       # Manual ETL trigger to verify
 ```
 
 ## One-time Setup: Snowflake User Email for Alerts

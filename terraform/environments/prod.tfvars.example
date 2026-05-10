@@ -1,0 +1,39 @@
+# terraform/environments/prod.tfvars.example
+#
+# Template for prod.tfvars. To use:
+#   1. cp prod.tfvars.example prod.tfvars
+#   2. Replace every <YOUR_*> placeholder below with your actual values
+#   3. prod.tfvars is gitignored — never commit your filled-in copy
+#
+# Sensitive auth (Snowflake password) is NOT in this file — pass via env var:
+#   export TF_VAR_snowflake_password=...
+
+environment    = "prod"
+aws_region     = "us-east-1"
+aws_account_id = "<YOUR_AWS_ACCOUNT_ID>"  # 12-digit AWS account number
+
+cost_center = "engineering-data-platform"
+team_owner  = "<YOUR_TEAM_DL>"  # team distribution list, e.g. data-engineering@company.com
+
+# Networking
+vpc_cidr           = "10.3.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+
+# External — upstream dropzone bucket (NOT created by terraform; bootstrap manually)
+dropzone_bucket_name = "dataai-dropzone-prod-<YOUR_AWS_ACCOUNT_ID>"
+
+# Observability — must be a verified Snowflake-bound email (see README "Snowflake User Email for Alerts")
+alarm_email = "<YOUR_ONCALL_EMAIL>"  # e.g. data-engineering-oncall@company.com
+
+# Snowflake
+snowflake_account   = "<YOUR_SNOWFLAKE_ACCOUNT>"  # e.g. xy12345.us-east-1
+snowflake_user      = "TERRAFORM_SVC_PROD"
+snowflake_role      = "ACCOUNTADMIN"
+snowflake_warehouse = "COMPUTE_WH"
+
+# Glue
+glue_dpu_standard    = 20
+glue_timeout_minutes = 180
+
+# Deploy orchestration
+triggers_enabled = true

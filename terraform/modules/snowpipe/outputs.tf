@@ -11,3 +11,11 @@ output "snowpipe_sqs_arn" {
 output "snowpipe_sqs_url" {
   value = aws_sqs_queue.snowpipe.url
 }
+
+output "snowpipe_dlq_arn" {
+  value = aws_sqs_queue.snowpipe_dlq.arn
+}
+
+output "snowpipe_dlq_url" {
+  value = aws_sqs_queue.snowpipe_dlq.url
+}
