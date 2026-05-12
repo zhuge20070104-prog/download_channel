@@ -4,6 +4,12 @@
 USE DATABASE IODP_DC_${ENV};
 USE SCHEMA RAW_STAGE;
 
+-- 0. PIPE 必须先 DROP — 在 STAGE/FILE_FORMAT 被 CREATE OR REPLACE 之前。
+--    否则 stage 被 drop 时，引用它的 PIPE 立即进入 STOPPED_STAGE_DROPPED
+--    死锁状态（即使后续 CREATE OR REPLACE PIPE 也不能完全重置该 state）。
+--    DROP IF EXISTS：首次部署该对象不存在，不阻塞。
+DROP PIPE IF EXISTS PIPE_DC_WIDE;
+
 -- 1. File Format
 CREATE OR REPLACE FILE FORMAT PARQUET_FF
   TYPE = PARQUET
@@ -16,6 +22,10 @@ CREATE OR REPLACE STAGE SILVER_S3_STAGE
   FILE_FORMAT = PARQUET_FF;
 
 -- 3. Pipe (AUTO_INGEST)
+-- Snowflake 自动分配一个 SQS（见 SYSTEM$PIPE_STATUS.notificationChannelName），
+-- S3 bucket notification 的 queue block 会直发到这个 SQS 触发 COPY。
+-- 那个 SQS ARN 是动态的（每个 PIPE 不同），靠 scripts/get_pipe_sqs_arn.sh 在
+-- terraform apply 前提取，通过 -var=snowflake_pipe_sqs_arn=... 注入 storage 模块。
 CREATE OR REPLACE PIPE PIPE_DC_WIDE
   AUTO_INGEST = TRUE
   COMMENT = 'Auto-ingest Silver S3 Parquet into SILVER.DC_WIDE'

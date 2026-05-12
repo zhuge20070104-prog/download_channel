@@ -37,6 +37,7 @@ REQUIRED_ARGS = [
     "CHECKPOINT_TABLE",
     "SNS_TOPIC_ARN",
     "ENVIRONMENT",
+    "AWS_REGION",
 ]
 OPTIONAL_ARGS = ["BACKFILL_MODE", "TARGET_DT", "TARGET_STORE", "LOOKBACK_DAYS"]
 present_optional = [a for a in OPTIONAL_ARGS if f"--{a}" in sys.argv]
@@ -68,7 +69,7 @@ sns_client = boto3.client("sns")
 glue_client = boto3.client("glue")
 checkpoint = CheckpointManager(
     table_name=args["CHECKPOINT_TABLE"],
-    aws_region=args.get("AWS_REGION", "us-east-1"),
+    aws_region=args["AWS_REGION"],
 )
 
 DROPZONE_PREFIX = "download_channel/narrow/"

@@ -15,14 +15,15 @@ availability_zones = ["ap-southeast-1a", "ap-southeast-1b"]
 dropzone_bucket_name = "dataai-dropzone-dev-165518479671"  # TODO: replace
 
 # Observability
-alarm_email = "fredric2010@outlook.com"  
+alarm_email = "zhuge20070104@gmail.com"
 
 # Snowflake
-# TODO: 这个account的话，需要到snowflake 网站上去申请。
-snowflake_account   = "xy12345.us-east-1"  # TODO: replace
-snowflake_user      = "TERRAFORM_SVC_DEV"  # TODO: replace
-snowflake_role      = "ACCOUNTADMIN"
-snowflake_warehouse = "COMPUTE_WH"
+
+snowflake_organization_name = "QNPCBZM"
+snowflake_account_name      = "GL59064"
+snowflake_user              = "FREDRIC"
+snowflake_role              = "ACCOUNTADMIN"
+snowflake_warehouse         = "COMPUTE_WH"
 
 # Glue
 glue_dpu_standard    = 10

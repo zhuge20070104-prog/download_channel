@@ -1,5 +1,14 @@
 # modules/snowflake/main.tf
 
+terraform {
+  required_providers {
+    snowflake = {
+      source  = "snowflakedb/snowflake"
+      version = "~> 1.0"
+    }
+  }
+}
+
 locals {
   env_upper = upper(var.environment)
 }
@@ -200,12 +209,12 @@ resource "snowflake_grant_privileges_to_account_role" "schema_silver_reader" {
 
 resource "snowflake_storage_integration" "s3_int" {
   name    = "IODP_DC_S3_INT_${local.env_upper}"
-  type    = "EXTERNAL_STAGE"
   enabled = true
 
-  storage_provider         = "S3"
+  storage_provider          = "S3"
   storage_allowed_locations = ["s3://${var.silver_bucket_name}/"]
   storage_aws_role_arn      = var.snowpipe_iam_role_arn
 
   comment = "S3 integration for Silver bucket — ${var.environment}"
 }
+

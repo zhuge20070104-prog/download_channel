@@ -95,7 +95,7 @@ download_channel/
 
 ## Initial Setup (one-time, before first deploy)
 
-These five steps must be done once per environment before `make init`. They are intentionally not automated because they involve resources outside this stack: an upstream-owned bucket, a Snowflake account, and email verification.
+These six steps must be done once per environment before `make init`. They are intentionally not automated because they involve resources outside this stack: an upstream-owned bucket, a Snowflake account, email verification, and the Terraform backend state itself (chicken-and-egg — Terraform can't create the bucket it stores its own state in).
 
 ### 1. Copy the tfvars template
 
@@ -105,19 +105,56 @@ These five steps must be done once per environment before `make init`. They are 
 cp terraform/environments/dev.tfvars.example terraform/environments/dev.tfvars
 ```
 
-### 2. Fill in placeholders in `dev.tfvars`
+### 2. Set up Snowflake (account + user + email verification)
+
+If you don't have a Snowflake account, register a free trial at https://signup.snowflake.com. After signup, note three values you'll need for `dev.tfvars`:
+
+- **Account locator** (e.g. `qnpcbzm-gl59064` — find via `SELECT CURRENT_ACCOUNT(), CURRENT_ORGANIZATION_NAME();` in the Snowflake web console)
+- **Username** (the one you chose during signup)
+- **Region** — make sure it matches `aws_region` in `dev.tfvars` (e.g. AWS `ap-southeast-1` = Snowflake `AWS_AP_SOUTHEAST_1`); cross-region adds egress + latency
+
+Then bind a verified email to your Snowflake user and click the verification link Snowflake mails you — see [One-time Setup: Snowflake User Email for Alerts](#one-time-setup-snowflake-user-email-for-alerts) below for the exact SQL. The email you bind here **must equal** `alarm_email` in `dev.tfvars`, otherwise alerts silently fail.
+
+### 3. Fill in placeholders in `dev.tfvars`
 
 Open the file and replace every `<YOUR_*>` placeholder:
 
 | Placeholder | What to put |
 |---|---|
 | `<YOUR_AWS_ACCOUNT_ID>` (twice) | Your 12-digit AWS account ID — get via `aws sts get-caller-identity --query Account --output text` |
-| `<YOUR_EMAIL>` (twice) | Email for `team_owner` and `alarm_email`. **`alarm_email` must match the verified Snowflake user email in step 4.** |
-| `<YOUR_SNOWFLAKE_ACCOUNT>` | Your Snowflake account locator (e.g. `xy12345.us-east-1`) — see step 4 |
+| `<YOUR_EMAIL>` (twice) | Email for `team_owner` and `alarm_email`. **`alarm_email` must equal the verified Snowflake user email from step 2.** |
+| `<YOUR_SNOWFLAKE_ACCOUNT>` | The account locator from step 2 (e.g. `qnpcbzm-gl59064`) |
+| `snowflake_user` | The username from step 2 |
 
 The `dropzone_bucket_name` follows the convention `dataai-dropzone-dev-<YOUR_AWS_ACCOUNT_ID>` — keep that pattern when filling in.
 
-### 3. Create the upstream dropzone bucket
+### 4. Export secrets as environment variables
+
+The Snowflake password is `sensitive = true` in Terraform and never lives in `*.tfvars`. AWS credentials must also be set before any `aws`/`terraform` command runs. Export at minimum:
+
+```bash
+export AWS_PROFILE=your-profile           # or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+export SNOWFLAKE_USER=...                 # from step 2
+export SNOWFLAKE_PASSWORD=...
+export SNOWFLAKE_ACCOUNT=qnpcbzm-gl59064  # from step 2
+export TF_VAR_snowflake_password="${SNOWFLAKE_PASSWORD}"   # Terraform reads this; provider doesn't auto-pick SNOWFLAKE_PASSWORD
+```
+
+Add these to your shell profile (or a `.envrc` if you use direnv) so they persist across sessions. Full reference: [Environment Variables](#environment-variables) below.
+
+### 5. Bootstrap the Terraform backend state bucket
+
+Terraform stores its state in S3 (`iodp-terraform-state-<env>`), but **that bucket has to exist before `terraform init` runs** — Terraform can't create the bucket it'll later use to track itself. One-time bootstrap:
+
+```bash
+make bootstrap-tf-backend ENV=dev
+```
+
+This creates the S3 state bucket with versioning + AES256 encryption + public access block. **State locking uses S3 native conditional writes (`use_lockfile = true`)** — no DynamoDB table needed (the older `dynamodb_table` parameter is deprecated as of Terraform 1.10+).
+
+The command is idempotent — re-running it on an existing bucket just prints "already exists, skipping."
+
+### 6. Create the upstream dropzone bucket
 
 In production this bucket is owned by Data.ai (the upstream provider) and Terraform deliberately does not manage it (see `terraform/variables.tf` — variable `dropzone_bucket_name` is in the `# ─── External ───` section). For demo, create it yourself:
 
@@ -127,26 +164,6 @@ aws s3 mb "s3://dataai-dropzone-dev-${ACCOUNT_ID}" --region ap-southeast-1
 ```
 
 If you skip this, `terraform apply` succeeds (the ARN is interpolated, not data-sourced) but Glue jobs will hit AccessDenied at runtime against a non-existent bucket — confusing failure mode.
-
-### 4. Set up Snowflake (account + user + email verification)
-
-If you don't have a Snowflake account, register a free trial at https://signup.snowflake.com — the account locator (e.g. `xy12345.us-east-1`) goes into `dev.tfvars` as `snowflake_account`.
-
-Then bind a verified email to a Snowflake user and click the verification link Snowflake mails you — see [One-time Setup: Snowflake User Email for Alerts](#one-time-setup-snowflake-user-email-for-alerts) below for the exact SQL. The email you bind here **must equal** `alarm_email` in `dev.tfvars`, otherwise alerts silently fail.
-
-### 5. Export secrets as environment variables
-
-The Snowflake password is `sensitive = true` in Terraform and never lives in `*.tfvars`. Export the env vars listed in [Environment Variables](#environment-variables) — at minimum:
-
-```bash
-export AWS_PROFILE=your-profile
-export SNOWFLAKE_USER=...
-export SNOWFLAKE_PASSWORD=...
-export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
-export TF_VAR_snowflake_password="${SNOWFLAKE_PASSWORD}"   # Terraform reads this; provider doesn't auto-pick SNOWFLAKE_PASSWORD
-```
-
-Add these to your shell profile (or a `.envrc` if you use direnv) so they persist across sessions.
 
 ---
 

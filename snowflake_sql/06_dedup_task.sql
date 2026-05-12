@@ -10,34 +10,36 @@ USE DATABASE IODP_DC_${ENV};
 USE SCHEMA SILVER;
 
 -- 1. 创建去重 Task
+-- snowsql splits on `;` by default, so a multi-statement BEGIN..END body
+-- gets cut at the first inner `;` and Snowflake sees EOF mid-CREATE TASK.
+-- Snowflake allows a single SQL statement as TASK body (no scripting block
+-- needed), so we keep the DELETE bare. If this ever grows to >1 statement,
+-- wrap the body in `$$ BEGIN ... END $$` dollar-quoting instead of BEGIN/END.
 CREATE OR REPLACE TASK IODP_DC_DEDUP_${ENV}
   WAREHOUSE = COMPUTE_WH_DC_${ENV}
   SCHEDULE  = 'USING CRON 0 6 * * * UTC'     -- 每日 UTC 06:00
   COMMENT   = 'Daily dedup for restate window in SILVER.DC_WIDE'
 AS
-BEGIN
-  -- 标记要删除的重复行（保留每组 PK 中 _loaded_at 最大的）
-  DELETE FROM SILVER.DC_WIDE
-  WHERE (_loaded_at, dt, product_id, app_store, country, device) IN (
-    SELECT _loaded_at, dt, product_id, app_store, country, device
-    FROM (
-      SELECT
-        _loaded_at,
-        dt,
-        product_id,
-        app_store,
-        country,
-        device,
-        ROW_NUMBER() OVER (
-          PARTITION BY dt, product_id, app_store, country, device
-          ORDER BY _loaded_at DESC
-        ) AS rn
-      FROM SILVER.DC_WIDE
-      WHERE dt >= DATEADD('day', -10, CURRENT_DATE())
-    )
-    WHERE rn > 1
-  );
-END;
+DELETE FROM SILVER.DC_WIDE
+WHERE (_loaded_at, dt, product_id, app_store, country, device) IN (
+  SELECT _loaded_at, dt, product_id, app_store, country, device
+  FROM (
+    SELECT
+      _loaded_at,
+      dt,
+      product_id,
+      app_store,
+      country,
+      device,
+      ROW_NUMBER() OVER (
+        PARTITION BY dt, product_id, app_store, country, device
+        ORDER BY _loaded_at DESC
+      ) AS rn
+    FROM SILVER.DC_WIDE
+    WHERE dt >= DATEADD('day', -10, CURRENT_DATE())
+  )
+  WHERE rn > 1
+);
 
 -- 2. 启用 Task
 ALTER TASK IODP_DC_DEDUP_${ENV} RESUME;

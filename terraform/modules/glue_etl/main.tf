@@ -137,6 +137,7 @@ resource "aws_glue_job" "bronze_etl" {
     "--CHECKPOINT_TABLE"                   = var.checkpoint_table_name
     "--SNS_TOPIC_ARN"                      = var.sns_alert_topic_arn
     "--ENVIRONMENT"                        = var.environment
+    "--AWS_REGION"                         = var.aws_region
   }
 
   tags = var.tags
@@ -175,6 +176,7 @@ resource "aws_glue_job" "silver_etl" {
     "--CHECKPOINT_TABLE"                   = var.checkpoint_table_name
     "--SNS_TOPIC_ARN"                      = var.sns_alert_topic_arn
     "--ENVIRONMENT"                        = var.environment
+    "--AWS_REGION"                         = var.aws_region
   }
 
   tags = var.tags

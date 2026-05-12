@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS DC_WIDE (
   _loaded_at                TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
 )
 CLUSTER BY (dt)
-COMMENT = 'Download Channel unified wide table — loaded by Snowpipe';
+COMMENT = 'Download Channel unified wide table - loaded by Snowpipe';
 
 -- Grants
 GRANT INSERT ON TABLE SILVER.DC_WIDE TO ROLE IODP_DC_LOAD_${ENV};

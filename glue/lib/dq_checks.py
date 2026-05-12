@@ -198,7 +198,9 @@ class DownloadChannelDQ:
             c = col(col_name) < 0
             condition = c if condition is None else condition | c
 
-        negative_count = df.filter(condition).count() if condition else 0
+        # PySpark Column 不能做 `if col:` truth-test（会抛 "Cannot convert column into bool"）。
+        # 必须显式 `is not None`。
+        negative_count = df.filter(condition).count() if condition is not None else 0
         passed = negative_count == 0
 
         return DQResult(

@@ -5,10 +5,12 @@
 SHELL := /bin/bash
 
 ENV            ?= dev
-AWS_REGION     ?= us-east-1
-AWS_ACCOUNT_ID ?= $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
 TF_DIR         := terraform
 TF_VARS        := -var-file=environments/$(ENV).tfvars
+# AWS_REGION 默认从 tfvars 读出来，避免 us-east-1 / ap-southeast-1 不一致。
+# 仍可显式 override: make <target> ENV=dev AWS_REGION=us-west-2
+AWS_REGION     ?= $(shell grep -E '^\s*aws_region' $(TF_DIR)/environments/$(ENV).tfvars 2>/dev/null | sed -E 's/.*=\s*"([^"]+)".*/\1/')
+AWS_ACCOUNT_ID ?= $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
 
 # ════════════════════════════════════════════════════════════════
 #  Preflight
@@ -37,6 +39,41 @@ check-snowflake: ## Validate Snowflake credentials
 	@echo "Snowflake env vars OK."
 
 # ════════════════════════════════════════════════════════════════
+#  Bootstrap (one-time, before first `make init`)
+# ════════════════════════════════════════════════════════════════
+
+.PHONY: bootstrap-tf-backend
+bootstrap-tf-backend: ## One-time: create Terraform state bucket (S3 native locking, no DynamoDB)
+	@BUCKET="iodp-terraform-state-$(ENV)"; \
+	REGION=$$(awk -F'"' '/^region/{print $$2; exit}' $(TF_DIR)/environments/backend-$(ENV).hcl); \
+	if [ -z "$$REGION" ]; then \
+		echo "ERROR: could not read region from $(TF_DIR)/environments/backend-$(ENV).hcl"; exit 1; \
+	fi; \
+	echo "=== Bootstrapping Terraform backend (bucket=$$BUCKET, region=$$REGION) ==="; \
+	if aws s3api head-bucket --bucket "$$BUCKET" 2>/dev/null; then \
+		echo "  ✓ Bucket $$BUCKET already exists, skipping creation"; \
+	else \
+		echo "  -> Creating bucket..."; \
+		if [ "$$REGION" = "us-east-1" ]; then \
+			aws s3api create-bucket --bucket "$$BUCKET" --region "$$REGION" > /dev/null; \
+		else \
+			aws s3api create-bucket --bucket "$$BUCKET" --region "$$REGION" \
+				--create-bucket-configuration LocationConstraint="$$REGION" > /dev/null; \
+		fi; \
+		echo "  -> Enabling versioning..."; \
+		aws s3api put-bucket-versioning --bucket "$$BUCKET" \
+			--versioning-configuration Status=Enabled; \
+		echo "  -> Enabling AES256 encryption..."; \
+		aws s3api put-bucket-encryption --bucket "$$BUCKET" \
+			--server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'; \
+		echo "  -> Blocking public access..."; \
+		aws s3api put-public-access-block --bucket "$$BUCKET" \
+			--public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"; \
+		echo "  ✓ Bucket created with versioning + AES256 + public access blocked"; \
+	fi; \
+	echo "  i State locking uses S3 native (use_lockfile=true); no DynamoDB needed"
+
+# ════════════════════════════════════════════════════════════════
 #  Glue Scripts
 # ════════════════════════════════════════════════════════════════
 
@@ -50,7 +87,7 @@ upload-glue-scripts: ## Package and upload Glue scripts to S3
 # ════════════════════════════════════════════════════════════════
 
 .PHONY: init
-init: check-tools check-aws check-snowflake upload-glue-scripts deploy-infra-phase1 apply-snowflake-sql deploy-infra-phase2 apply-athena-ddl ## Full 6-phase deploy
+init: check-tools check-aws check-snowflake deploy-infra-phase1 upload-glue-scripts apply-snowflake-sql deploy-infra-phase2 apply-athena-ddl ## Full 6-phase deploy
 	@echo ""
 	@echo "========================================="
 	@echo "  Deploy complete! Verify with:"
@@ -58,7 +95,13 @@ init: check-tools check-aws check-snowflake upload-glue-scripts deploy-infra-pha
 	@echo "========================================="
 
 .PHONY: deploy-infra-phase1
-deploy-infra-phase1: ## Phase 1: TF apply (infra + Snowflake, no triggers)
+deploy-infra-phase1: ## Phase 1: TF apply (infra + Snowflake + snowpipe AWS role, no Glue triggers)
+	# module.snowpipe MUST be in phase 1: it creates the IAM role that
+	# Snowflake's CREATE PIPE (in 04_pipe.sql) AssumeRoles. Without it,
+	# 04_pipe.sql fails with "User ... is not authorized to perform
+	# sts:AssumeRole" because the target role does not yet exist.
+	# module.observability is pulled in as a transitive dependency of
+	# snowpipe (sns_alert_topic_arn); listed explicitly for clarity.
 	cd $(TF_DIR) && terraform init -reconfigure -backend-config=environments/backend-$(ENV).hcl && terraform apply \
 		$(TF_VARS) \
 		-var='triggers_enabled=false' \
@@ -66,7 +109,10 @@ deploy-infra-phase1: ## Phase 1: TF apply (infra + Snowflake, no triggers)
 		-target=module.storage \
 		-target=module.dynamodb \
 		-target=module.glue_catalog \
-		-target=module.snowflake
+		-target=module.snowflake \
+		-target=module.observability \
+		-target=module.snowpipe \
+		-auto-approve
 
 .PHONY: apply-snowflake-sql
 apply-snowflake-sql: ## Phase 2: Run Snowflake SQL (01-08). Pass FORCE=1 to bypass the "stateful object already exists" safety gate (required for redeploys).
@@ -80,8 +126,16 @@ apply-snowflake-sql: ## Phase 2: Run Snowflake SQL (01-08). Pass FORCE=1 to bypa
 	bash scripts/apply_snowflake_sql.sh $$FORCE_FLAG "$(ENV)" "$(AWS_ACCOUNT_ID)" "$$ALERT_EMAIL_VAL"
 
 .PHONY: deploy-infra-phase2
-deploy-infra-phase2: ## Phase 3: Full TF apply (triggers enabled)
-	cd $(TF_DIR) && terraform apply $(TF_VARS)
+deploy-infra-phase2: ## Phase 3: Full TF apply (triggers enabled). Auto-extracts Snowflake pipe SQS ARN.
+	@PIPE_SQS_ARN=$$(bash scripts/get_pipe_sqs_arn.sh $(ENV) 2>/dev/null); \
+	EXTRA_VAR=""; \
+	if [ -n "$$PIPE_SQS_ARN" ]; then \
+		echo "Snowflake AUTO_INGEST SQS ARN: $$PIPE_SQS_ARN"; \
+		EXTRA_VAR="-var=snowflake_pipe_sqs_arn=$$PIPE_SQS_ARN"; \
+	else \
+		echo "NOTE: Snowflake pipe SQS ARN not available — bucket notification queue block will be skipped this apply (run 04_pipe.sql first, or re-run this target after)."; \
+	fi; \
+	cd $(TF_DIR) && terraform apply $(TF_VARS) $$EXTRA_VAR -auto-approve
 
 .PHONY: apply-athena-ddl
 apply-athena-ddl: ## Register Athena tables
@@ -99,6 +153,31 @@ deploy: ## Everyday update: full terraform apply
 run-etl: ## Trigger full Glue Workflow (Bronze → Silver)
 	aws glue start-workflow-run --name "dc-etl-workflow-$(ENV)" --region $(AWS_REGION)
 	@echo "Workflow started. Monitor: aws glue get-workflow-run --name dc-etl-workflow-$(ENV) --region $(AWS_REGION)"
+
+.PHONY: demo
+demo: ## End-to-end demo: seed dropzone → wait → run Bronze→Silver workflow. DT=YYYY-MM-DD optional (default today UTC).
+	@DT="$${DT:-$$(date -u +%Y-%m-%d)}"; \
+	echo "=== 1/3 Seeding dropzone for dt=$$DT (1000 groups × 4 channels = 4000 rows) ==="; \
+	RUN_ID=$$(aws glue start-job-run \
+		--job-name "iodp-dc-dropzone-seeder-$(ENV)" \
+		--arguments "{\"--TARGET_DT\":\"$$DT\",\"--TARGET_STORE\":\"ios\",\"--ROW_COUNT\":\"1000\",\"--SCENARIO\":\"clean\"}" \
+		--region $(AWS_REGION) --query 'JobRunId' --output text); \
+	echo "Seed JobRunId: $$RUN_ID"; \
+	echo "=== 2/3 Waiting for seed to finish ==="; \
+	while true; do \
+		STATE=$$(aws glue get-job-run --job-name "iodp-dc-dropzone-seeder-$(ENV)" --run-id "$$RUN_ID" --region $(AWS_REGION) --query 'JobRun.JobRunState' --output text); \
+		echo "  state=$$STATE"; \
+		case "$$STATE" in \
+			SUCCEEDED) break ;; \
+			FAILED|STOPPED|TIMEOUT|ERROR) echo "ERROR: seed ended with state=$$STATE"; exit 1 ;; \
+		esac; \
+		sleep 5; \
+	done; \
+	echo "=== 3/3 Triggering Bronze → Silver workflow ==="; \
+	aws glue start-workflow-run --name "dc-etl-workflow-$(ENV)" --region $(AWS_REGION); \
+	echo ""; \
+	echo "Done. Monitor with:"; \
+	echo "  make status ENV=$(ENV)"
 
 .PHONY: run-bronze
 run-bronze: ## Trigger Bronze ETL only (DT=YYYY-MM-DD optional)

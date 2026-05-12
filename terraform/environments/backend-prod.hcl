@@ -5,6 +5,5 @@
 # Note: the state bucket itself can live in any region (independent of the
 # resources you're deploying). Pick whatever region your state bucket is in.
 
-bucket         = "iodp-terraform-state-prod"
-region         = "us-east-1"
-dynamodb_table = "iodp-terraform-locks"
+bucket = "iodp-terraform-state-prod"
+region = "us-east-1"

@@ -137,7 +137,7 @@ resource "aws_iam_role_policy" "dlq_report_lambda" {
 
 data "archive_file" "dlq_report" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../lambda/dlq_weekly_report"
+  source_dir  = abspath("${path.module}/../../../lambda/dlq_weekly_report")
   output_path = "${path.module}/lambda_dlq_report.zip"
 }
 
@@ -150,8 +150,6 @@ resource "aws_lambda_function" "dlq_weekly_report" {
   timeout          = 120
   memory_size      = 256
   role             = aws_iam_role.dlq_report_lambda.arn
-
-  reserved_concurrent_executions = 1
 
   environment {
     variables = {
@@ -242,7 +240,7 @@ resource "aws_iam_role_policy" "stale_lock_lambda" {
 
 data "archive_file" "stale_lock" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../lambda/stale_lock_check"
+  source_dir  = abspath("${path.module}/../../../lambda/stale_lock_check")
   output_path = "${path.module}/lambda_stale_lock.zip"
 }
 
@@ -255,8 +253,6 @@ resource "aws_lambda_function" "stale_lock_check" {
   timeout          = 60
   memory_size      = 256
   role             = aws_iam_role.stale_lock_lambda.arn
-
-  reserved_concurrent_executions = 1
 
   environment {
     variables = {
@@ -346,7 +342,7 @@ resource "aws_iam_role_policy" "dropzone_freshness_lambda" {
 
 data "archive_file" "dropzone_freshness" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../lambda/dropzone_freshness_check"
+  source_dir  = abspath("${path.module}/../../../lambda/dropzone_freshness_check")
   output_path = "${path.module}/lambda_dropzone_freshness.zip"
 }
 
@@ -359,8 +355,6 @@ resource "aws_lambda_function" "dropzone_freshness_check" {
   timeout          = 60
   memory_size      = 256
   role             = aws_iam_role.dropzone_freshness_lambda.arn
-
-  reserved_concurrent_executions = 1
 
   environment {
     variables = {

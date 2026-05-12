@@ -5462,3 +5462,130 @@ Cross-account dropzone 用同样的招：
 
 直觉的"鸡生蛋"在 single-account demo 下不存在——授权长在 bronze role 一边、IAM 创建 policy 时不校验 ARN 存在性，所以**先桶后 role 还是先 role 后桶都行，只在 bronze 运行时双方都得齐**。Cross-account production 场景下确实有真的循环依赖，但解法是**predictable ARN**（提前用命名规约把 ARN 拼出来给上游写 bucket policy），这个项目里 Snowflake ↔ Snowpipe 已经实战用过这一招。
 
+---
+
+## p) 选型对比：DynamoDB vs S3 Datalake vs Snowflake
+
+### 这是什么
+
+百亿级 download_channel 数据为什么不直接进 DynamoDB？只用 S3 + Athena 不够吗？为什么要引入 Snowflake 这一层（连带它的集成痛点）？三个工具的**正确分工**长这样：
+
+| 层 | 工具 | 为什么 |
+|----|------|--------|
+| ETL checkpoint | DynamoDB | <1KB/行的 OLTP state，PK lookup，sparse GSI 高效 |
+| 数据湖（raw → silver） | S3 + Parquet | 廉价 immutable 存储 + Glue/Athena schema-on-read |
+| BI 服务层 | Snowflake | BI 工具原生支持 + MERGE/dedup/time-travel/Dynamic Tables |
+
+### 1. DynamoDB 适合做数仓吗？— 完全不适合
+
+**根本错位：DynamoDB 是 OLTP KV store，不是分析引擎。**
+
+| 查询 | DynamoDB | Snowflake | 数据湖 (Athena) |
+|------|----------|-----------|------------------|
+| `WHERE pk = X` 单行查询 | < 10ms ✅ | 100-500ms | 秒级 |
+| `GROUP BY country SUM(downloads)` 聚合 | **不支持，必须全扫** | < 1s | 5-30s |
+| JOIN 多表 | 不支持 | ✅ | ✅ |
+| 窗口函数 / `QUALIFY ROW_NUMBER` | 不支持 | ✅ | ✅ |
+| 时间序列 `LAG/LEAD` | 不支持 | ✅ | ✅ |
+| BI 工具（Tableau/PowerBI）原生连接 | 几乎没有 | ✅ | ✅ |
+
+**百亿级 download_channel 数据塞进 DynamoDB 的账单**：
+
+假设 100 亿行 × 200 字节/行 ≈ **2 TB**
+
+- **存储**：DynamoDB on-demand $0.25/GB/月 → **$500/月 just for storage**（同等数据 S3 Parquet 压缩后 ~500GB → S3 $12/月，Snowflake ~$30/月）
+- **查询**：BI 团队要看「2024 全年 iOS 各国下载量 TOP10」，DynamoDB 必须**全表 Scan**（没有合适索引能做 GROUP BY）：
+  - 2 TB / 4KB = **5 亿 RCU**
+  - 0.5 × $0.25 per 1M RCU = **$125/单次查询**
+  - 100 个 BI 用户 × 每天 10 次 = $125,000/天 😨
+
+**DynamoDB 在本项目里干啥**：[modules/dynamodb/main.tf](terraform/modules/dynamodb/main.tf) 那张 `iodp-dc-checkpoint-dev` 只存 ETL 状态快照——行宽 < 1KB（dt + store + last_status + md5 + ts）、行数几千行最多、访问模式纯 PK lookup、sparse GSI 加速"找正在跑的 job"。**完美 OLTP 用法**，不是数仓。
+
+### 2. S3 Data Lake (Athena) vs Snowflake — 互补不互替
+
+| 维度 | S3 + Athena | Snowflake |
+|------|-------------|-----------|
+| 存储成本（2TB raw） | ~$12/月（S3 Standard） | ~$30-60/月（FDN compressed） |
+| 冷数据归档 | ✅ S3 Glacier $0.004/GB | ❌ 必须留 hot |
+| 查询定价模型 | $5/TB scanned | 仓库时间 ($2-32/hr × auto-suspend) |
+| BI dashboard 10 用户并发 | $5-50/天（depends on partitioning） | 单 SMALL 仓 $48/天（auto-suspend 后可降到 $10） |
+| dashboard 延迟 | 5-30s | < 2s（仓库 warm 时） |
+| schema evolution | schema-on-read 灵活但易乱 | schema-on-write + VARIANT，governance 好 |
+| MERGE / UPSERT | ❌（Athena 3 部分支持，限制多） | ✅ 原生 |
+| ACID 事务 | ❌（除非用 Iceberg/Delta） | ✅ |
+| time travel | ❌ 需要自己版本化 | ✅ 默认 1 天，可延 90 天 |
+| Dynamic Tables / 物化视图自动刷新 | ❌（Athena 3 有 MV 但严限制） | ✅ 增量刷新 |
+| dedup 滑窗（restate 后去重） | 复杂（要写 GROUP BY + INSERT OVERWRITE） | 一个 TASK + DELETE 搞定（[06_dedup_task.sql](snowflake_sql/06_dedup_task.sql)）|
+| Snowpipe 持续 ingest | ❌（Athena 没这概念） | ✅ |
+| clones / zero-copy | ❌ | ✅（用于回填/AB 测试整库克隆） |
+| lock-in 程度 | 低（开放格式 + 标准 SQL） | 中-高（SF SQL 方言、特有功能） |
+
+**在 download_channel 项目里两者分工**（lakehouse + warehouse 共存模式）：
+
+```
+Dropzone S3 (narrow Parquet, 业务源头)
+  ↓ Bronze ETL
+Bronze S3 (验证 narrow + 元数据)        ← Athena ad-hoc 查询
+  ↓ Silver ETL
+Silver S3 (pivot wide)                    ← Athena 也能直查
+  ↓ Snowpipe AUTO_INGEST
+Snowflake SILVER.DC_WIDE (副本)           ← BI 直查热数据 < 2s
+  ↓ Dynamic Table 自动刷新
+Snowflake GOLD.DC_DAILY_BY_APP / 等聚合  ← Dashboard 调它们
+```
+
+**为啥 Silver 写两份**（S3 + Snowflake）？
+- **S3 Silver**：source of truth、便宜 archive、可重跑全 ETL、迁库或换数仓时不被锁
+- **Snowflake SILVER**：BI 服务副本，Snowpipe 自动同步，dashboard 体验秒级
+
+两者解耦——以后换 BigQuery 也只换 Snowpipe → BQ Storage Write API，S3 那份不动。
+
+**何时纯 S3+Athena 就够**：
+- 没有交互式 BI dashboard，只做 batch 报表
+- 查询频率 < 100/天
+- 用户能忍 10-30s 延迟
+- 数据 < 1TB，partition 设计得好
+
+**何时必须 Snowflake**：
+- 交互式 dashboard，秒级响应
+- 需要 MERGE 处理 SCD2 / restate window
+- 跨数据集 JOIN，特别是 fact × dimension
+- 多团队并发 + RBAC 数据治理
+- 时间旅行做回溯调试
+
+### 3. Snowflake 集成痛点 — 值得吗？
+
+| 痛点 | 原因 | 行业现状 |
+|------|------|---------|
+| Storage Integration 跨账户 IAM 信任握手 | Snowflake 不信你的 AWS account 凭据，要预测 ARN 破循环依赖 | 所有数仓-云厂商集成都这样（Redshift Spectrum, BigQuery Omni 类似） |
+| Notification Integration 双 IAM + SQS poll | 同上 | 同 |
+| Provider 版本碎片化（0.98 vs 1.x、AWS_SQS 移除） | terraform-provider-snowflake 还在快速迭代，Snowflake 把 provider 从 Labs 接管后 API 大改 | 早期数仓 provider 通病；BigQuery 的 google-beta provider 也类似 |
+| SYSTEM$SEND_EMAIL 邮件验证强制 | 防止滥发邮件 | Snowflake 特色，可以理解但 dev 阶段烦 |
+| 跨账户 SNS→SQS 不能 auto-confirm | Snowflake 的 SQS 不响应 ConfirmSubscription 握手——这是设计选择（防别人 hijack 你的 ingest 队列） | 必须用 S3 → SQS 直发或 Notification Integration |
+
+**决策框架**：
+- 创业公司 < 5 人 DE 团队，数据 < 1TB：**S3 + Athena + dbt-athena**。运维负担最低
+- 中型公司 5-50 DE，需要 BI 团队 self-service：**Snowflake / Databricks**，集成痛但功能值
+- 大厂 100+ DE，强 governance 需求：**Snowflake + Iceberg + 自建 platform**
+
+**对 portfolio 而言**集成痛点反而是 talking point——能讲：
+- Storage / Notification Integration 的 chicken-and-egg + 怎么用 predictable ARN 破
+- terraform provider 版本升级（0.98 → 1.x namespace 迁移）+ state replace-provider
+- Snowpipe 跨账户 SQS 注入模式（S3 direct vs SNS fan-out vs Notification Integration）的 trade-off
+- Snowflake `SYSTEM$SEND_EMAIL` 邮件验证 + 备选 Lambda 反推方案
+
+senior 跟 mid-level DE 的区别就在这——后者按文档抄一遍，senior 知道每条路的坑跟 trade-off。
+
+### 一句话总结
+
+**「DynamoDB 是状态机，S3 是仓库，Snowflake 是工厂」**
+
+- 状态机存元数据（小、热、PK lookup）
+- 仓库存货（大、冷、便宜、不动）
+- 工厂加工成成品给客户（贵、热、查得快）
+
+百亿级 download_channel 数据：
+- 进 DynamoDB？反向操作，破产警告 ❌
+- 只进 S3+Athena？可行，省钱但 BI 体验差，没有 dedup/MERGE ⚠️
+- S3 + Snowflake 双写？贵 ~$200/月（dev 规模），但功能完整 + portfolio 加分 ✅（本项目）
+

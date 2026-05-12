@@ -10,6 +10,22 @@ variable "aws_account_id" {
   type        = string
 }
 
+variable "snowflake_pipe_sqs_arn" {
+  description = <<-EOT
+    Snowflake-managed SQS ARN for Snowpipe AUTO_INGEST (PIPE_DC_WIDE).
+    Snowflake auto-allocates this on PIPE creation, in *Snowflake's* AWS
+    account (e.g. arn:aws:sqs:ap-southeast-1:782091841703:sf-snowpipe-...).
+    Auto-populated by Makefile's deploy-infra-phase2 via
+    scripts/get_pipe_sqs_arn.sh which queries SYSTEM$PIPE_STATUS at deploy
+    time. Default empty handles first-deploy bootstrap (before 04_pipe.sql
+    has run): bucket notification queue block is skipped, terraform
+    proceeds, next deploy after pipe creation picks up the ARN.
+  EOT
+  type        = string
+  default     = ""
+}
+
+
 variable "environment" {
   description = "Deployment environment"
   type        = string
@@ -68,8 +84,13 @@ variable "triggers_enabled" {
 
 # ─── Snowflake ───
 
-variable "snowflake_account" {
-  description = "Snowflake account identifier (e.g. xy12345.us-east-1)"
+variable "snowflake_organization_name" {
+  description = "Snowflake organization name (left half of <ORG>-<ACCOUNT>, e.g. QNPCBZM)"
+  type        = string
+}
+
+variable "snowflake_account_name" {
+  description = "Snowflake account name (right half of <ORG>-<ACCOUNT>, e.g. GL59064)"
   type        = string
 }
 

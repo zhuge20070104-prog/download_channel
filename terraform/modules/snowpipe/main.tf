@@ -115,8 +115,13 @@ resource "aws_sqs_queue_policy" "snowpipe" {
 }
 
 # ════════════════════════════════════════════════════════════════
-#  SNS Subscription: Silver S3 events → SQS
+#  SNS Subscription: Silver S3 events → user SQS (for monitoring)
 # ════════════════════════════════════════════════════════════════
+# Note: Snowpipe AUTO_INGEST does NOT consume this SQS. The S3 → Snowflake
+# direct delivery is configured in modules/storage's bucket notification
+# (queue block targeting Snowflake's auto-allocated SQS). This subscription
+# is kept for the CloudWatch alarms below — it's a dangling monitoring tap
+# unless events get rewired to Snowpipe via NOTIFICATION_INTEGRATION later.
 
 resource "aws_sns_topic_subscription" "snowpipe" {
   topic_arn = var.silver_sns_topic_arn

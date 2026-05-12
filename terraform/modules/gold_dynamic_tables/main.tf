@@ -3,6 +3,15 @@
 # Dynamic Tables are created via snowflake_sql/05_gold_dynamic_tables.sql.
 # This module manages only the grants that need to stay in Terraform state.
 
+terraform {
+  required_providers {
+    snowflake = {
+      source  = "snowflakedb/snowflake"
+      version = "~> 1.0"
+    }
+  }
+}
+
 # Grant SELECT on all future tables in GOLD to reader
 resource "snowflake_grant_privileges_to_account_role" "gold_future_select_reader" {
   privileges        = ["SELECT"]

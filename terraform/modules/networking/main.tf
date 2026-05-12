@@ -108,7 +108,7 @@ resource "aws_route_table_association" "private" {
 
 resource "aws_security_group" "glue" {
   name_prefix = "iodp-dc-glue-${var.environment}-"
-  description = "Glue ENI security group — self-referencing for Spark shuffle"
+  description = "Glue ENI security group - self-referencing for Spark shuffle"
   vpc_id      = aws_vpc.main.id
 
   ingress {

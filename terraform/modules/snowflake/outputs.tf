@@ -45,3 +45,4 @@ output "storage_aws_external_id" {
   description = "Snowflake external ID for trust policy"
   value       = snowflake_storage_integration.s3_int.storage_aws_external_id
 }
+

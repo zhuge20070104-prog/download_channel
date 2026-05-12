@@ -53,7 +53,7 @@ GROUP BY dt, country, app_store;
 CREATE OR REPLACE DYNAMIC TABLE DC_PAID_VS_ORGANIC_TREND
   TARGET_LAG = '1 hour'
   WAREHOUSE  = COMPUTE_WH_DC_${ENV}
-  COMMENT    = 'Paid vs organic downloads trend — trailing 30 days'
+  COMMENT    = 'Paid vs organic downloads trend - trailing 30 days'
 AS
 SELECT
   dt,

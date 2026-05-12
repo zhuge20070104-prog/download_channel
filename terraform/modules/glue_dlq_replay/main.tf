@@ -28,6 +28,7 @@ resource "aws_glue_job" "dlq_replay" {
     "--DROPZONE_BUCKET"                    = var.dropzone_bucket_name
     "--ENVIRONMENT"                        = var.environment
     "--FAILED_AT_DATE"                     = "PLACEHOLDER"
+    "--AWS_REGION"                         = var.aws_region
   }
 
   tags = var.tags

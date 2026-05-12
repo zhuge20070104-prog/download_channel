@@ -20,6 +20,14 @@
 
 set -euo pipefail
 
+# WSL Ubuntu's default locale is often POSIX/C, which makes Python (snowsql)
+# decode stdin as ASCII. UTF-8 chars in SQL comments / string literals then
+# break into lone surrogate bytes — Snowflake rejects with
+# `Invalid Unicode string literal; low surrogate '\uDCE7'`.
+# Force UTF-8 for both system locale and Python.
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+export PYTHONUTF8=1
+
 usage() {
     cat <<EOF
 Usage: $0 [--force] <ENVIRONMENT> <AWS_ACCOUNT_ID> [ALERT_EMAIL]
@@ -78,6 +86,29 @@ ENV_LOWER=$(echo "${ENV}" | tr '[:upper:]' '[:lower:]')
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SQL_DIR="${SCRIPT_DIR}/snowflake_sql"
 
+# ─── Credentials: map SNOWFLAKE_* → SNOWSQL_* ───────────────────────────
+# snowsql does not read SNOWFLAKE_* (those are for the Terraform Snowflake
+# provider). It reads SNOWSQL_ACCOUNT / SNOWSQL_USER / SNOWSQL_PWD (or a
+# ~/.snowsql/config file). We map one way so the user maintains a single
+# set of env vars (SNOWFLAKE_*, validated by Makefile's check-snowflake).
+: "${SNOWSQL_ACCOUNT:=${SNOWFLAKE_ACCOUNT:-}}"
+: "${SNOWSQL_USER:=${SNOWFLAKE_USER:-}}"
+: "${SNOWSQL_PWD:=${SNOWFLAKE_PASSWORD:-}}"
+export SNOWSQL_ACCOUNT SNOWSQL_USER SNOWSQL_PWD
+
+if [[ -z "${SNOWSQL_ACCOUNT}" || -z "${SNOWSQL_USER}" || -z "${SNOWSQL_PWD}" ]]; then
+    cat >&2 <<EOF
+ERROR: snowsql credentials missing. Set these in your shell:
+  export SNOWFLAKE_ACCOUNT=<org-account>     # e.g. QNPCBZM-GL59064
+  export SNOWFLAKE_USER=<user>
+  export SNOWFLAKE_PASSWORD=<password>
+(snowsql itself reads SNOWSQL_*, but this script maps from SNOWFLAKE_* so
+ you only maintain one set — the same vars Terraform's Snowflake provider
+ already uses.)
+EOF
+    exit 1
+fi
+
 # ─── Helpers ────────────────────────────────────────────────────────────
 # probe_snowsql: run a query that may legitimately fail (e.g. SHOW in a
 # schema that does not yet exist on first deploy). Always returns 0; we
@@ -100,6 +131,16 @@ extract_marker() {
 }
 
 # ─── Preflight 1: ALERT_EMAIL is registered to a Snowflake user ─────────
+# Only enforced when 08_freshness_alert.sql is present in SQL_DIR. If that
+# file has been renamed to *.skip (e.g. outlook.com fails Snowflake email
+# verification — see DEPLOY-ISSUES.md issue #12), SYSTEM$SEND_EMAIL is not
+# used by any deploying SQL, so the check is moot.
+if [[ ! -f "${SQL_DIR}/08_freshness_alert.sql" ]]; then
+    echo "=== Preflight 1/2: SKIPPED — 08_freshness_alert.sql not present ==="
+    echo "  (no SQL in this deploy uses SYSTEM\$SEND_EMAIL)"
+    echo ""
+    EMAIL_STATUS="REGISTERED"  # bypass for use further down (unused after this block)
+else
 echo "=== Preflight 1/2: verifying ALERT_EMAIL is bound to a Snowflake user ==="
 
 EMAIL_OUTPUT=$(probe_snowsql -q "
@@ -146,6 +187,7 @@ EOF
 fi
 echo "  ✓ ALERT_EMAIL is registered (operator must still verify the link)"
 echo ""
+fi
 
 # ─── Preflight 2: stateful object existence check ───────────────────────
 # Each entry: TYPE|SHOW_QUERY|HUMAN_NAME|SQL_FILE
@@ -169,6 +211,7 @@ SKIP_FILES=()
 EXISTING_OBJECTS=()
 for probe in "${STATEFUL_PROBES[@]}"; do
     IFS='|' read -r OBJ_TYPE SHOW_QUERY OBJ_NAME SQL_FILE <<< "${probe}"
+    echo "  probing ${OBJ_TYPE}..." >&2
 
     PROBE_OUTPUT=$(probe_snowsql -q "
 ${SHOW_QUERY};
@@ -176,9 +219,17 @@ SELECT '::COUNT::' || COUNT(*) FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
 ")
     COUNT=$(echo "${PROBE_OUTPUT}" | extract_marker '::COUNT::')
     COUNT=${COUNT:-0}
+    echo "    → count=${COUNT}" >&2
 
     if [[ "${COUNT}" -gt 0 ]]; then
-        EXISTING_OBJECTS+=("${OBJ_TYPE}: ${OBJ_NAME}  (defined in ${SQL_FILE})  [${COUNT} match$( [[ ${COUNT} -gt 1 ]] && echo es)]")
+        # Pluralize "match"/"matches" via if (not `&&`) because under `set -e`
+        # a failed `[[ ]]` inside command substitution returns 1, which
+        # propagates as the array-assignment's exit code and kills the script.
+        PLURAL=""
+        if [[ "${COUNT}" -gt 1 ]]; then
+            PLURAL="es"
+        fi
+        EXISTING_OBJECTS+=("${OBJ_TYPE}: ${OBJ_NAME}  (defined in ${SQL_FILE})  [${COUNT} match${PLURAL}]")
     fi
 done
 

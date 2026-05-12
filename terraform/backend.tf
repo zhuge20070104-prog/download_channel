@@ -14,7 +14,8 @@
 
 terraform {
   backend "s3" {
-    key     = "download-channel/terraform.tfstate"
-    encrypt = true
+    key          = "download-channel/terraform.tfstate"
+    encrypt      = true
+    use_lockfile = true
   }
 }

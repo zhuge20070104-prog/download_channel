@@ -22,11 +22,19 @@ provider "aws" {
 }
 
 provider "snowflake" {
-  account   = var.snowflake_account
-  user      = var.snowflake_user
-  password  = var.snowflake_password
-  role      = var.snowflake_role
-  warehouse = var.snowflake_warehouse
+  organization_name = var.snowflake_organization_name
+  account_name      = var.snowflake_account_name
+  user              = var.snowflake_user
+  password          = var.snowflake_password
+  role              = var.snowflake_role
+  warehouse         = var.snowflake_warehouse
+
+  # 1.x 把 storage_integration 标成 preview，必须显式 opt-in。否则 plan 报
+  # "resource X is currently a preview feature, must be enabled by adding ...
+  #  to preview_features_enabled". notification_integration 不再使用，已移除。
+  preview_features_enabled = [
+    "snowflake_storage_integration_resource",
+  ]
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -45,12 +53,13 @@ module "networking" {
 module "storage" {
   source = "./modules/storage"
 
-  environment         = var.environment
-  aws_account_id      = var.aws_account_id
-  dead_letter_prefix  = "dead_letter/"
+  environment             = var.environment
+  aws_account_id          = var.aws_account_id
+  dead_letter_prefix      = "dead_letter/"
   ia_transition_days      = 30
   glacier_transition_days = 90
   expiration_days         = 365
+  snowflake_pipe_sqs_arn  = var.snowflake_pipe_sqs_arn
   tags                    = local.mandatory_tags
 }
 
@@ -102,6 +111,7 @@ module "glue_etl" {
   source = "./modules/glue_etl"
 
   environment          = var.environment
+  aws_region           = var.aws_region
   dropzone_bucket_name = var.dropzone_bucket_name
   bronze_bucket_name   = module.storage.bronze_bucket_name
   bronze_bucket_arn    = module.storage.bronze_bucket_arn
@@ -122,6 +132,7 @@ module "glue_dlq_replay" {
   source = "./modules/glue_dlq_replay"
 
   environment              = var.environment
+  aws_region               = var.aws_region
   glue_execution_role_arn  = module.glue_etl.glue_execution_role_arn
   scripts_bucket_name      = module.storage.scripts_bucket_name
   bronze_bucket_name       = module.storage.bronze_bucket_name

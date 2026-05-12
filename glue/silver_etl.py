@@ -40,6 +40,7 @@ REQUIRED_ARGS = [
     "CHECKPOINT_TABLE",
     "SNS_TOPIC_ARN",
     "ENVIRONMENT",
+    "AWS_REGION",
 ]
 OPTIONAL_ARGS = ["BACKFILL_MODE", "TARGET_DT", "TARGET_STORE", "LOOKBACK_DAYS"]
 present_optional = [a for a in OPTIONAL_ARGS if f"--{a}" in sys.argv]
@@ -70,7 +71,7 @@ sns_client = boto3.client("sns")
 glue_client = boto3.client("glue")
 checkpoint = CheckpointManager(
     table_name=args["CHECKPOINT_TABLE"],
-    aws_region=args.get("AWS_REGION", "us-east-1"),
+    aws_region=args["AWS_REGION"],
 )
 
 BRONZE_PREFIX = "download_channel/narrow/"
@@ -237,10 +238,16 @@ def process_partition(dt: str, store: str):
         wide_df = pivot_narrow_to_wide(bronze_df)
 
         # ─── 5. DQ 卡点 ───
-        expected_count = bronze_ckpt.get("out_count")
+        # Bronze 的 out_count 是 narrow 行数（4 channels × N groups），silver pivot
+        # 后是 wide 行数（N groups，4 channel 摊成 4 列）。两者不可直接比，否则
+        # row_count check 会以 ~75% diff 误报。改用 bronze_df 的 distinct group
+        # key 数作为 wide-expected 基线。
+        expected_wide_count = bronze_df.select(
+            "dt", "product_id", "app_store", "country", "device"
+        ).distinct().count()
         dq = DownloadChannelDQ(
             partition_dt=dt,
-            expected_count=int(expected_count) if expected_count else None,
+            expected_count=expected_wide_count,
         )
         dq_results = dq.run_all(wide_df)
 

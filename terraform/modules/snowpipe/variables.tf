@@ -26,10 +26,12 @@ variable "snowflake_external_id" {
   type        = string
 }
 
+
 variable "sns_alert_topic_arn" {
   description = "SNS topic ARN to receive CloudWatch alarms for DLQ / queue-stale events"
   type        = string
 }
+
 
 variable "tags" {
   type    = map(string)

@@ -1,0 +1,1204 @@
+Checking required tools...
+All tools OK.
+AWS credentials OK: arn:aws:iam::165518479671:user/fredricz
+Snowflake env vars OK.
+# module.snowpipe MUST be in phase 1: it creates the IAM role that
+# Snowflake's CREATE PIPE (in 04_pipe.sql) AssumeRoles. Without it,
+# 04_pipe.sql fails with "User ... is not authorized to perform
+# sts:AssumeRole" because the target role does not yet exist.
+# module.observability is pulled in as a transitive dependency of
+# snowpipe (sns_alert_topic_arn); listed explicitly for clarity.
+cd terraform && terraform init -reconfigure -backend-config=environments/backend-dev.hcl && terraform apply \
+	-var-file=environments/dev.tfvars \
+	-var='triggers_enabled=false' \
+	-target=module.networking \
+	-target=module.storage \
+	-target=module.dynamodb \
+	-target=module.glue_catalog \
+	-target=module.snowflake \
+	-target=module.observability \
+	-target=module.snowpipe \
+	-auto-approve
+[0m[1mInitializing the backend...[0m
+[0m[32m
+Successfully configured the backend "s3"! Terraform will automatically
+use this backend unless the backend configuration changes.[0m
+[0m[1mInitializing modules...[0m
+[0m[1mInitializing provider plugins...[0m
+- Reusing previous version of hashicorp/archive from the dependency lock file
+- Reusing previous version of hashicorp/aws from the dependency lock file
+- Reusing previous version of snowflake-labs/snowflake from the dependency lock file
+- Using previously-installed hashicorp/aws v5.100.0
+- Using previously-installed snowflake-labs/snowflake v0.98.0
+- Using previously-installed hashicorp/archive v2.4.2
+
+[33m╷[0m[0m
+[33m│[0m [0m[1m[33mWarning: [0m[0m[1mAdditional provider information from registry[0m
+[33m│[0m [0m
+[33m│[0m [0m[0mThe remote registry returned warnings for
+[33m│[0m [0mregistry.terraform.io/snowflake-labs/snowflake:
+[33m│[0m [0m- For users on Terraform 0.13 or greater, this provider has moved to
+[33m│[0m [0msnowflakedb/snowflake. Please update your source in required_providers.
+[33m╵[0m[0m
+[0m[1m[32mTerraform has been successfully initialized![0m[32m[0m
+[0m[32m
+You may now begin working with Terraform. Try running "terraform plan" to see
+any changes that are required for your infrastructure. All Terraform commands
+should now work.
+
+If you ever set or change modules or backend configuration for Terraform,
+rerun this command to reinitialize your working directory. If you forget, other
+commands will detect it and remind you to do so if necessary.[0m
+[0m[1mmodule.observability.data.archive_file.dlq_report: Reading...[0m[0m
+[0m[1mmodule.observability.data.archive_file.dropzone_freshness: Reading...[0m[0m
+[0m[1mmodule.observability.data.archive_file.stale_lock: Reading...[0m[0m
+[0m[1mmodule.observability.data.archive_file.stale_lock: Read complete after 0s [id=f2ff76d7a86f25cd5f4799383a2e45a535969f87][0m
+[0m[1mmodule.observability.data.archive_file.dlq_report: Read complete after 0s [id=32c5e4aa58f8de55ec8bb83b0a9218bf4db1e725][0m
+[0m[1mmodule.observability.data.archive_file.dropzone_freshness: Read complete after 0s [id=8a9ba56d6aef00a295395841338642ebd225bbcb][0m
+[0m[1mmodule.observability.aws_cloudwatch_log_group.dlq_report: Refreshing state... [id=/aws/lambda/iodp-dc-dlq-weekly-report-dev][0m
+[0m[1mmodule.observability.aws_iam_role.stale_lock_lambda: Refreshing state... [id=iodp-dc-stale-lock-lambda-dev][0m
+[0m[1mmodule.observability.aws_cloudwatch_log_group.dropzone_freshness: Refreshing state... [id=/aws/lambda/iodp-dc-dropzone-freshness-dev][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_rule.dropzone_freshness: Refreshing state... [id=iodp-dc-dropzone-freshness-dev][0m
+[0m[1mmodule.observability.aws_iam_role.dropzone_freshness_lambda: Refreshing state... [id=iodp-dc-dropzone-freshness-lambda-dev][0m
+[0m[1mmodule.observability.aws_iam_role.dlq_report_lambda: Refreshing state... [id=iodp-dc-dlq-report-lambda-dev][0m
+[0m[1mmodule.storage.aws_s3_bucket.scripts: Refreshing state... [id=iodp-dc-scripts-dev-165518479671][0m
+[0m[1mmodule.networking.aws_vpc.main: Refreshing state... [id=vpc-027143e479786bcda][0m
+[0m[1mmodule.storage.aws_s3_bucket.bronze: Refreshing state... [id=iodp-dc-bronze-dev-165518479671][0m
+[0m[1mmodule.networking.aws_eip.nat: Refreshing state... [id=eipalloc-0d36521edf06a97fe][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_rule.stale_lock: Refreshing state... [id=iodp-dc-stale-lock-dev][0m
+[0m[1mmodule.observability.aws_sns_topic.alerts: Refreshing state... [id=arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-alerts-dev][0m
+[0m[1mmodule.storage.aws_s3_bucket.silver: Refreshing state... [id=iodp-dc-silver-dev-165518479671][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_rule.glue_job_failed: Refreshing state... [id=iodp-dc-glue-job-failed-dev][0m
+[0m[1mmodule.snowpipe.aws_sqs_queue.snowpipe_dlq: Refreshing state... [id=https://sqs.ap-southeast-1.amazonaws.com/165518479671/iodp-dc-snowpipe-dlq-dev][0m
+[0m[1mmodule.glue_catalog.aws_glue_catalog_database.silver_dc: Refreshing state... [id=165518479671:iodp_dc_silver_dev][0m
+[0m[1mmodule.observability.aws_cloudwatch_dashboard.dc_etl: Refreshing state... [id=iodp-dc-etl-dev][0m
+[0m[1mmodule.dynamodb.aws_dynamodb_table.checkpoint: Refreshing state... [id=iodp-dc-checkpoint-dev][0m
+[0m[1mmodule.observability.aws_cloudwatch_log_group.stale_lock: Refreshing state... [id=/aws/lambda/iodp-dc-stale-lock-check-dev][0m
+[0m[1mmodule.glue_catalog.aws_glue_catalog_database.bronze_dc: Refreshing state... [id=165518479671:iodp_dc_bronze_dev][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_rule.dlq_weekly: Refreshing state... [id=iodp-dc-dlq-weekly-dev][0m
+[0m[1mmodule.storage.aws_sns_topic.silver_notifications: Refreshing state... [id=arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-silver-s3-notify-dev][0m
+[0m[1mmodule.snowflake.snowflake_account_role.transform: Refreshing state... [id=IODP_DC_TRANSFORM_DEV][0m
+[0m[1mmodule.snowflake.snowflake_warehouse.dc: Refreshing state... [id=COMPUTE_WH_DC_DEV][0m
+[0m[1mmodule.snowflake.snowflake_account_role.reader: Refreshing state... [id=IODP_DC_READER_DEV][0m
+[0m[1mmodule.snowflake.snowflake_database.dc: Refreshing state... [id=IODP_DC_DEV][0m
+[0m[1mmodule.snowflake.snowflake_account_role.load: Refreshing state... [id=IODP_DC_LOAD_DEV][0m
+[0m[1mmodule.observability.aws_sns_topic_policy.alerts_allow_events: Refreshing state... [id=arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-alerts-dev][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_target.glue_job_failed_sns: Refreshing state... [id=iodp-dc-glue-job-failed-dev-terraform-20260511084241505400000001][0m
+[0m[1mmodule.observability.aws_sns_topic_subscription.email: Refreshing state... [id=arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-alerts-dev:217665e2-dcb3-4b27-88d4-ef135bf1b84d][0m
+[0m[1mmodule.storage.aws_s3_bucket_public_access_block.scripts: Refreshing state... [id=iodp-dc-scripts-dev-165518479671][0m
+[0m[1mmodule.storage.aws_s3_bucket_server_side_encryption_configuration.scripts: Refreshing state... [id=iodp-dc-scripts-dev-165518479671][0m
+[0m[1mmodule.networking.aws_security_group.glue: Refreshing state... [id=sg-00e9a21a8cb112641][0m
+[0m[1mmodule.networking.aws_subnet.public[0]: Refreshing state... [id=subnet-0db5d287a50b93f7e][0m
+[0m[1mmodule.networking.aws_subnet.public[1]: Refreshing state... [id=subnet-093b020587e3a50b4][0m
+[0m[1mmodule.networking.aws_internet_gateway.main: Refreshing state... [id=igw-04f7345e56db25881][0m
+[0m[1mmodule.networking.aws_subnet.private[1]: Refreshing state... [id=subnet-01f1cad124e8531ef][0m
+[0m[1mmodule.networking.aws_subnet.private[0]: Refreshing state... [id=subnet-0f30b88c4b19b4192][0m
+[0m[1mmodule.storage.aws_s3_bucket_server_side_encryption_configuration.bronze: Refreshing state... [id=iodp-dc-bronze-dev-165518479671][0m
+[0m[1mmodule.storage.aws_s3_bucket_public_access_block.bronze: Refreshing state... [id=iodp-dc-bronze-dev-165518479671][0m
+[0m[1mmodule.storage.aws_s3_bucket_versioning.bronze: Refreshing state... [id=iodp-dc-bronze-dev-165518479671][0m
+[0m[1mmodule.storage.aws_s3_bucket_lifecycle_configuration.bronze: Refreshing state... [id=iodp-dc-bronze-dev-165518479671][0m
+[0m[1mmodule.snowpipe.aws_sqs_queue.snowpipe: Refreshing state... [id=https://sqs.ap-southeast-1.amazonaws.com/165518479671/iodp-dc-snowpipe-queue-dev][0m
+[0m[1mmodule.snowflake.snowflake_grant_account_role.transform_to_sysadmin: Refreshing state... [id="IODP_DC_TRANSFORM_DEV"|ROLE|"SYSADMIN"][0m
+[0m[1mmodule.observability.aws_iam_role_policy.dropzone_freshness_lambda: Refreshing state... [id=iodp-dc-dropzone-freshness-lambda-dev:iodp-dc-dropzone-freshness-lambda-policy-dev][0m
+[0m[1mmodule.observability.aws_lambda_function.dropzone_freshness_check: Refreshing state... [id=iodp-dc-dropzone-freshness-dev][0m
+[0m[1mmodule.storage.aws_sns_topic_policy.silver_notifications: Refreshing state... [id=arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-silver-s3-notify-dev][0m
+[0m[1mmodule.storage.aws_s3_bucket_server_side_encryption_configuration.silver: Refreshing state... [id=iodp-dc-silver-dev-165518479671][0m
+[0m[1mmodule.storage.aws_s3_bucket_lifecycle_configuration.silver: Refreshing state... [id=iodp-dc-silver-dev-165518479671][0m
+[0m[1mmodule.storage.aws_s3_bucket_versioning.silver: Refreshing state... [id=iodp-dc-silver-dev-165518479671][0m
+[0m[1mmodule.storage.aws_s3_bucket_public_access_block.silver: Refreshing state... [id=iodp-dc-silver-dev-165518479671][0m
+[0m[1mmodule.networking.aws_route_table.public: Refreshing state... [id=rtb-006547087b49338d3][0m
+[0m[1mmodule.networking.aws_nat_gateway.main: Refreshing state... [id=nat-0c9ef4be300158d53][0m
+[0m[1mmodule.snowpipe.aws_cloudwatch_metric_alarm.snowpipe_dlq_has_messages: Refreshing state... [id=iodp-dc-snowpipe-dlq-not-empty-dev][0m
+[0m[1mmodule.snowpipe.aws_cloudwatch_metric_alarm.snowpipe_queue_age: Refreshing state... [id=iodp-dc-snowpipe-queue-stale-dev][0m
+[0m[1mmodule.snowflake.snowflake_grant_account_role.load_to_sysadmin: Refreshing state... [id="IODP_DC_LOAD_DEV"|ROLE|"SYSADMIN"][0m
+[0m[1mmodule.snowflake.snowflake_grant_account_role.reader_to_sysadmin: Refreshing state... [id="IODP_DC_READER_DEV"|ROLE|"SYSADMIN"][0m
+[0m[1mmodule.storage.aws_s3_bucket_notification.silver: Refreshing state... [id=iodp-dc-silver-dev-165518479671][0m
+[0m[1mmodule.observability.aws_lambda_function.dlq_weekly_report: Refreshing state... [id=iodp-dc-dlq-weekly-report-dev][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.wh_load: Refreshing state... [id="IODP_DC_LOAD_DEV"|false|false|USAGE|OnAccountObject|WAREHOUSE|"COMPUTE_WH_DC_DEV"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.wh_transform: Refreshing state... [id="IODP_DC_TRANSFORM_DEV"|false|false|USAGE|OnAccountObject|WAREHOUSE|"COMPUTE_WH_DC_DEV"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.wh_reader: Refreshing state... [id="IODP_DC_READER_DEV"|false|false|USAGE|OnAccountObject|WAREHOUSE|"COMPUTE_WH_DC_DEV"][0m
+[0m[1mmodule.observability.aws_iam_role_policy.dlq_report_lambda: Refreshing state... [id=iodp-dc-dlq-report-lambda-dev:iodp-dc-dlq-report-lambda-policy-dev][0m
+[0m[1mmodule.snowpipe.aws_sqs_queue_policy.snowpipe: Refreshing state... [id=https://sqs.ap-southeast-1.amazonaws.com/165518479671/iodp-dc-snowpipe-queue-dev][0m
+[0m[1mmodule.snowpipe.aws_sns_topic_subscription.snowpipe: Refreshing state... [id=arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-silver-s3-notify-dev:768fd065-d984-49ee-81bb-7877b028b878][0m
+[0m[1mmodule.networking.aws_route_table_association.public[1]: Refreshing state... [id=rtbassoc-05690ae132a03be7d][0m
+[0m[1mmodule.networking.aws_route_table_association.public[0]: Refreshing state... [id=rtbassoc-027b62d7d21c2c32d][0m
+[0m[1mmodule.networking.aws_route_table.private: Refreshing state... [id=rtb-045d05acb25654e55][0m
+[0m[1mmodule.snowflake.snowflake_storage_integration.s3_int: Refreshing state... [id=IODP_DC_S3_INT_DEV][0m
+[0m[1mmodule.snowflake.snowflake_schema.gold: Refreshing state... [id="IODP_DC_DEV"."GOLD"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.db_transform: Refreshing state... [id="IODP_DC_TRANSFORM_DEV"|false|false|USAGE|OnAccountObject|DATABASE|"IODP_DC_DEV"][0m
+[0m[1mmodule.snowflake.snowflake_schema.silver: Refreshing state... [id="IODP_DC_DEV"."SILVER"][0m
+[0m[1mmodule.snowflake.snowflake_schema.raw_stage: Refreshing state... [id="IODP_DC_DEV"."RAW_STAGE"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.db_load: Refreshing state... [id="IODP_DC_LOAD_DEV"|false|false|USAGE|OnAccountObject|DATABASE|"IODP_DC_DEV"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.db_reader: Refreshing state... [id="IODP_DC_READER_DEV"|false|false|USAGE|OnAccountObject|DATABASE|"IODP_DC_DEV"][0m
+[0m[1mmodule.observability.aws_lambda_permission.eventbridge_dropzone_freshness: Refreshing state... [id=AllowEventBridgeInvoke][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_target.dropzone_freshness: Refreshing state... [id=iodp-dc-dropzone-freshness-dev-terraform-20260511084835515300000002][0m
+[0m[1mmodule.observability.aws_lambda_permission.eventbridge_dlq: Refreshing state... [id=AllowEventBridgeInvoke][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_target.dlq_weekly: Refreshing state... [id=iodp-dc-dlq-weekly-dev-terraform-20260511084829237700000001][0m
+[0m[1mmodule.networking.aws_route_table_association.private[0]: Refreshing state... [id=rtbassoc-0756abfabfb1ddce3][0m
+[0m[1mmodule.networking.aws_route_table_association.private[1]: Refreshing state... [id=rtbassoc-0ffdc098f79beebfe][0m
+[0m[1mmodule.observability.aws_iam_role_policy.stale_lock_lambda: Refreshing state... [id=iodp-dc-stale-lock-lambda-dev:iodp-dc-stale-lock-lambda-policy-dev][0m
+[0m[1mmodule.observability.aws_lambda_function.stale_lock_check: Refreshing state... [id=iodp-dc-stale-lock-check-dev][0m
+[0m[1mmodule.snowpipe.aws_iam_role.snowpipe_s3_access: Refreshing state... [id=iodp-dc-snowpipe-s3-dev][0m
+[0m[1mmodule.observability.aws_lambda_permission.eventbridge_stale_lock: Refreshing state... [id=AllowEventBridgeInvoke][0m
+[0m[1mmodule.observability.aws_cloudwatch_event_target.stale_lock: Refreshing state... [id=iodp-dc-stale-lock-dev-terraform-20260511084841762800000003][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.schema_silver_load: Refreshing state... [id="IODP_DC_LOAD_DEV"|false|false|USAGE|OnSchema|OnSchema|"IODP_DC_DEV"."SILVER"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.schema_silver_reader: Refreshing state... [id="IODP_DC_READER_DEV"|false|false|USAGE|OnSchema|OnSchema|"IODP_DC_DEV"."SILVER"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.schema_silver_transform: Refreshing state... [id="IODP_DC_TRANSFORM_DEV"|false|false|USAGE|OnSchema|OnSchema|"IODP_DC_DEV"."SILVER"][0m
+[0m[1mmodule.snowpipe.aws_iam_role_policy.snowpipe_s3_read: Refreshing state... [id=iodp-dc-snowpipe-s3-dev:iodp-dc-snowpipe-s3-read-dev][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.schema_raw_stage_load: Refreshing state... [id="IODP_DC_LOAD_DEV"|false|false|USAGE|OnSchema|OnSchema|"IODP_DC_DEV"."RAW_STAGE"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.schema_gold_transform: Refreshing state... [id="IODP_DC_TRANSFORM_DEV"|false|false|USAGE,CREATE DYNAMIC TABLE|OnSchema|OnSchema|"IODP_DC_DEV"."GOLD"][0m
+[0m[1mmodule.snowflake.snowflake_grant_privileges_to_account_role.schema_gold_reader: Refreshing state... [id="IODP_DC_READER_DEV"|false|false|USAGE|OnSchema|OnSchema|"IODP_DC_DEV"."GOLD"][0m
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  [33m~[0m update in-place[0m
+
+Terraform will perform the following actions:
+
+[1m  # module.dynamodb.aws_dynamodb_table.checkpoint[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_dynamodb_table" "checkpoint" {
+        id                          = "iodp-dc-checkpoint-dev"
+        name                        = "iodp-dc-checkpoint-dev"
+      [33m~[0m[0m tags                        = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                    = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (11 unchanged attributes hidden)[0m[0m
+
+        [90m# (7 unchanged blocks hidden)[0m[0m
+    }
+
+[1m  # module.glue_catalog.aws_glue_catalog_database.bronze_dc[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_glue_catalog_database" "bronze_dc" {
+        id           = "165518479671:iodp_dc_bronze_dev"
+        name         = "iodp_dc_bronze_dev"
+      [33m~[0m[0m tags         = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all     = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (5 unchanged attributes hidden)[0m[0m
+
+        [90m# (1 unchanged block hidden)[0m[0m
+    }
+
+[1m  # module.glue_catalog.aws_glue_catalog_database.silver_dc[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_glue_catalog_database" "silver_dc" {
+        id           = "165518479671:iodp_dc_silver_dev"
+        name         = "iodp_dc_silver_dev"
+      [33m~[0m[0m tags         = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all     = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (5 unchanged attributes hidden)[0m[0m
+
+        [90m# (1 unchanged block hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_eip.nat[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_eip" "nat" {
+        id                       = "eipalloc-0d36521edf06a97fe"
+      [33m~[0m[0m tags                     = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-nat-eip-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                 = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-nat-eip-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (17 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_internet_gateway.main[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_internet_gateway" "main" {
+        id       = "igw-04f7345e56db25881"
+      [33m~[0m[0m tags     = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-igw-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-igw-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (3 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_nat_gateway.main[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_nat_gateway" "main" {
+        id                                 = "nat-0c9ef4be300158d53"
+      [33m~[0m[0m tags                               = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-nat-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-nat-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (10 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_route_table.private[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_route_table" "private" {
+        id               = "rtb-045d05acb25654e55"
+      [33m~[0m[0m tags             = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-private-rt-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all         = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-private-rt-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (5 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_route_table.public[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_route_table" "public" {
+        id               = "rtb-006547087b49338d3"
+      [33m~[0m[0m tags             = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-public-rt-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all         = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-public-rt-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (5 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_security_group.glue[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_security_group" "glue" {
+        id                     = "sg-00e9a21a8cb112641"
+        name                   = "iodp-dc-glue-dev-20260511064527623200000001"
+      [33m~[0m[0m tags                   = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-glue-sg-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all               = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-glue-sg-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (8 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_subnet.private[0][0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_subnet" "private" {
+        id                                             = "subnet-0f30b88c4b19b4192"
+      [33m~[0m[0m tags                                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-private-ap-southeast-1a"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                                       = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-private-ap-southeast-1a"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (19 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_subnet.private[1][0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_subnet" "private" {
+        id                                             = "subnet-01f1cad124e8531ef"
+      [33m~[0m[0m tags                                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-private-ap-southeast-1b"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                                       = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-private-ap-southeast-1b"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (19 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_subnet.public[0][0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_subnet" "public" {
+        id                                             = "subnet-0db5d287a50b93f7e"
+      [33m~[0m[0m tags                                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-public-ap-southeast-1a"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                                       = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-public-ap-southeast-1a"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (19 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_subnet.public[1][0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_subnet" "public" {
+        id                                             = "subnet-093b020587e3a50b4"
+      [33m~[0m[0m tags                                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-public-ap-southeast-1b"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                                       = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-public-ap-southeast-1b"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (19 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.networking.aws_vpc.main[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_vpc" "main" {
+        id                                   = "vpc-027143e479786bcda"
+      [33m~[0m[0m tags                                 = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-vpc-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                             = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Name"        = "iodp-dc-vpc-dev"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (18 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_cloudwatch_event_rule.dlq_weekly[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_event_rule" "dlq_weekly" {
+        id                  = "iodp-dc-dlq-weekly-dev"
+        name                = "iodp-dc-dlq-weekly-dev"
+      [33m~[0m[0m tags                = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all            = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (9 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_cloudwatch_event_rule.dropzone_freshness[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_event_rule" "dropzone_freshness" {
+        id                  = "iodp-dc-dropzone-freshness-dev"
+        name                = "iodp-dc-dropzone-freshness-dev"
+      [33m~[0m[0m tags                = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all            = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (9 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_cloudwatch_event_rule.glue_job_failed[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_event_rule" "glue_job_failed" {
+        id                  = "iodp-dc-glue-job-failed-dev"
+        name                = "iodp-dc-glue-job-failed-dev"
+      [33m~[0m[0m tags                = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all            = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (10 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_cloudwatch_event_rule.stale_lock[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_event_rule" "stale_lock" {
+        id                  = "iodp-dc-stale-lock-dev"
+        name                = "iodp-dc-stale-lock-dev"
+      [33m~[0m[0m tags                = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all            = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (9 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_cloudwatch_log_group.dlq_report[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_log_group" "dlq_report" {
+        id                = "/aws/lambda/iodp-dc-dlq-weekly-report-dev"
+        name              = "/aws/lambda/iodp-dc-dlq-weekly-report-dev"
+      [33m~[0m[0m tags              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all          = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (6 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_cloudwatch_log_group.dropzone_freshness[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_log_group" "dropzone_freshness" {
+        id                = "/aws/lambda/iodp-dc-dropzone-freshness-dev"
+        name              = "/aws/lambda/iodp-dc-dropzone-freshness-dev"
+      [33m~[0m[0m tags              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all          = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (6 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_cloudwatch_log_group.stale_lock[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_log_group" "stale_lock" {
+        id                = "/aws/lambda/iodp-dc-stale-lock-check-dev"
+        name              = "/aws/lambda/iodp-dc-stale-lock-check-dev"
+      [33m~[0m[0m tags              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all          = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (6 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_iam_role.dlq_report_lambda[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_iam_role" "dlq_report_lambda" {
+        id                    = "iodp-dc-dlq-report-lambda-dev"
+        name                  = "iodp-dc-dlq-report-lambda-dev"
+      [33m~[0m[0m tags                  = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (11 unchanged attributes hidden)[0m[0m
+
+        [90m# (1 unchanged block hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_iam_role.dropzone_freshness_lambda[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_iam_role" "dropzone_freshness_lambda" {
+        id                    = "iodp-dc-dropzone-freshness-lambda-dev"
+        name                  = "iodp-dc-dropzone-freshness-lambda-dev"
+      [33m~[0m[0m tags                  = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (11 unchanged attributes hidden)[0m[0m
+
+        [90m# (1 unchanged block hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_iam_role.stale_lock_lambda[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_iam_role" "stale_lock_lambda" {
+        id                    = "iodp-dc-stale-lock-lambda-dev"
+        name                  = "iodp-dc-stale-lock-lambda-dev"
+      [33m~[0m[0m tags                  = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (11 unchanged attributes hidden)[0m[0m
+
+        [90m# (1 unchanged block hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_lambda_function.dlq_weekly_report[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_lambda_function" "dlq_weekly_report" {
+        id                             = "iodp-dc-dlq-weekly-report-dev"
+      [33m~[0m[0m tags                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                       = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (28 unchanged attributes hidden)[0m[0m
+
+        [90m# (4 unchanged blocks hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_lambda_function.dropzone_freshness_check[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_lambda_function" "dropzone_freshness_check" {
+        id                             = "iodp-dc-dropzone-freshness-dev"
+      [33m~[0m[0m tags                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                       = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (28 unchanged attributes hidden)[0m[0m
+
+        [90m# (4 unchanged blocks hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_lambda_function.stale_lock_check[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_lambda_function" "stale_lock_check" {
+        id                             = "iodp-dc-stale-lock-check-dev"
+      [33m~[0m[0m tags                           = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                       = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (28 unchanged attributes hidden)[0m[0m
+
+        [90m# (4 unchanged blocks hidden)[0m[0m
+    }
+
+[1m  # module.observability.aws_sns_topic.alerts[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_sns_topic" "alerts" {
+        id                                       = "arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-alerts-dev"
+        name                                     = "iodp-dc-alerts-dev"
+      [33m~[0m[0m tags                                     = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                                 = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (29 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.snowpipe.aws_cloudwatch_metric_alarm.snowpipe_dlq_has_messages[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_metric_alarm" "snowpipe_dlq_has_messages" {
+        id                                    = "iodp-dc-snowpipe-dlq-not-empty-dev"
+      [33m~[0m[0m tags                                  = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (21 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.snowpipe.aws_cloudwatch_metric_alarm.snowpipe_queue_age[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_cloudwatch_metric_alarm" "snowpipe_queue_age" {
+        id                                    = "iodp-dc-snowpipe-queue-stale-dev"
+      [33m~[0m[0m tags                                  = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (21 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.snowpipe.aws_iam_role.snowpipe_s3_access[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_iam_role" "snowpipe_s3_access" {
+        id                    = "iodp-dc-snowpipe-s3-dev"
+        name                  = "iodp-dc-snowpipe-s3-dev"
+      [33m~[0m[0m tags                  = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (11 unchanged attributes hidden)[0m[0m
+
+        [90m# (1 unchanged block hidden)[0m[0m
+    }
+
+[1m  # module.snowpipe.aws_sqs_queue.snowpipe[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_sqs_queue" "snowpipe" {
+        id                                = "https://sqs.ap-southeast-1.amazonaws.com/165518479671/iodp-dc-snowpipe-queue-dev"
+        name                              = "iodp-dc-snowpipe-queue-dev"
+      [33m~[0m[0m tags                              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                          = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (18 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.snowpipe.aws_sqs_queue.snowpipe_dlq[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_sqs_queue" "snowpipe_dlq" {
+        id                                = "https://sqs.ap-southeast-1.amazonaws.com/165518479671/iodp-dc-snowpipe-dlq-dev"
+        name                              = "iodp-dc-snowpipe-dlq-dev"
+      [33m~[0m[0m tags                              = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                          = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (18 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # module.storage.aws_s3_bucket.bronze[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_s3_bucket" "bronze" {
+        id                          = "iodp-dc-bronze-dev-165518479671"
+      [33m~[0m[0m tags                        = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                    = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (12 unchanged attributes hidden)[0m[0m
+
+        [90m# (5 unchanged blocks hidden)[0m[0m
+    }
+
+[1m  # module.storage.aws_s3_bucket.scripts[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_s3_bucket" "scripts" {
+        id                          = "iodp-dc-scripts-dev-165518479671"
+      [33m~[0m[0m tags                        = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                    = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (12 unchanged attributes hidden)[0m[0m
+
+        [90m# (3 unchanged blocks hidden)[0m[0m
+    }
+
+[1m  # module.storage.aws_s3_bucket.silver[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_s3_bucket" "silver" {
+        id                          = "iodp-dc-silver-dev-165518479671"
+      [33m~[0m[0m tags                        = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                    = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (12 unchanged attributes hidden)[0m[0m
+
+        [90m# (4 unchanged blocks hidden)[0m[0m
+    }
+
+[1m  # module.storage.aws_sns_topic.silver_notifications[0m will be updated in-place
+[0m  [33m~[0m[0m resource "aws_sns_topic" "silver_notifications" {
+        id                                       = "arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-silver-s3-notify-dev"
+        name                                     = "iodp-dc-silver-s3-notify-dev"
+      [33m~[0m[0m tags                                     = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+      [33m~[0m[0m tags_all                                 = {
+          [31m-[0m[0m "CostCenter"  = "engineering-data-platform"
+          [31m-[0m[0m "CreatedDate" = "2026-05-11"
+          [31m-[0m[0m "DataClass"   = "internal"
+          [31m-[0m[0m "Environment" = "dev"
+          [31m-[0m[0m "ManagedBy"   = "Terraform"
+          [31m-[0m[0m "Owner"       = "fredric2010@outlook.com"
+          [31m-[0m[0m "Project"     = "IODP-DownloadChannel"
+        } -> (known after apply)
+        [90m# (29 unchanged attributes hidden)[0m[0m
+    }
+
+[1mPlan:[0m [0m0 to add, 37 to change, 0 to destroy.
+[33m╷[0m[0m
+[33m│[0m [0m[1m[33mWarning: [0m[0m[1mResource targeting is in effect[0m
+[33m│[0m [0m
+[33m│[0m [0m[0mYou are creating a plan with the -target option, which means that the
+[33m│[0m [0mresult of this plan may not represent all of the changes requested by the
+[33m│[0m [0mcurrent configuration.
+[33m│[0m [0m
+[33m│[0m [0mThe -target option is not for routine use, and is provided only for
+[33m│[0m [0mexceptional situations such as recovering from errors or mistakes, or when
+[33m│[0m [0mTerraform specifically suggests to use it as part of an error message.
+[33m╵[0m[0m
+[33m╷[0m[0m
+[33m│[0m [0m[1m[33mWarning: [0m[0m[1mApplied changes may be incomplete[0m
+[33m│[0m [0m
+[33m│[0m [0m[0mThe plan was created with the -target option in effect, so some changes
+[33m│[0m [0mrequested in the configuration may have been ignored and the output values
+[33m│[0m [0mmay not be fully updated. Run the following command to verify that no other
+[33m│[0m [0mchanges are pending:
+[33m│[0m [0m    terraform plan
+[33m│[0m [0m
+[33m│[0m [0mNote that the -target option is not suitable for routine use, and is
+[33m│[0m [0mprovided only for exceptional situations such as recovering from errors or
+[33m│[0m [0mmistakes, or when Terraform specifically suggests to use it as part of an
+[33m│[0m [0merror message.
+[33m╵[0m[0m
+[33m╷[0m[0m
+[33m│[0m [0m[1m[33mWarning: [0m[0m[1mArgument is deprecated[0m
+[33m│[0m [0m
+[33m│[0m [0m[0m  with provider["registry.terraform.io/snowflake-labs/snowflake"],
+[33m│[0m [0m  on main.tf line 25, in provider "snowflake":
+[33m│[0m [0m  25:   account   = [4mvar.snowflake_account[0m[0m
+[33m│[0m [0m
+[33m│[0m [0mUse `account_name` and `organization_name` instead of `account`
+[33m│[0m [0m
+[33m│[0m [0m(and one more similar warning elsewhere)
+[33m╵[0m[0m
+[33m╷[0m[0m
+[33m│[0m [0m[1m[33mWarning: [0m[0m[1mInvalid Attribute Combination[0m
+[33m│[0m [0m
+[33m│[0m [0m[0m  with module.storage.aws_s3_bucket_lifecycle_configuration.bronze,
+[33m│[0m [0m  on modules/storage/main.tf line 43, in resource "aws_s3_bucket_lifecycle_configuration" "bronze":
+[33m│[0m [0m  43: resource "aws_s3_bucket_lifecycle_configuration" "bronze" [4m{[0m[0m
+[33m│[0m [0m
+[33m│[0m [0mNo attribute specified when one (and only one) of
+[33m│[0m [0m[rule[0].filter,rule[0].prefix] is required
+[33m│[0m [0m
+[33m│[0m [0mThis will be an error in a future version of the provider
+[33m│[0m [0m
+[33m│[0m [0m(and 3 more similar warnings elsewhere)
+[33m╵[0m[0m
+Releasing state lock. This may take a few moments...
+[0m[1m[32m
+Apply complete! Resources: 0 added, 0 changed, 0 destroyed.[0m
+[0m[1m[32m
+Outputs:
+
+[0mbronze_bucket_name = "iodp-dc-bronze-dev-165518479671"
+checkpoint_table_name = "iodp-dc-checkpoint-dev"
+private_subnet_ids = [
+  "subnet-0f30b88c4b19b4192",
+  "subnet-01f1cad124e8531ef",
+]
+scripts_bucket_name = "iodp-dc-scripts-dev-165518479671"
+silver_bucket_name = "iodp-dc-silver-dev-165518479671"
+snowflake_storage_external_id = "ZS68794_SFCRole=5_S7De+mtu2XsxTqmQgenfDob8uIg="
+snowflake_storage_integration_iam_user_arn = "arn:aws:iam::782091841703:user/q7yp1000-s"
+sns_alert_topic_arn = "arn:aws:sns:ap-southeast-1:165518479671:iodp-dc-alerts-dev"
+vpc_id = "vpc-027143e479786bcda"
+=== Packaging glue/lib/ into lib.zip ===
+  adding: lib/ (stored 0%)
+  adding: lib/checkpoint.py (deflated 64%)
+  adding: lib/dlq.py (deflated 59%)
+  adding: lib/dq_checks.py (deflated 69%)
+  adding: lib/schema_v1_narrow.py (deflated 56%)
+  adding: lib/schema_v2_wide.py (deflated 59%)
+  adding: lib/__init__.py (stored 0%)
+=== Uploading Glue scripts to s3://iodp-dc-scripts-dev-165518479671/glue/ ===
+Completed 12.3 KiB/12.3 KiB (18.3 KiB/s) with 1 file(s) remainingupload: glue/bronze_etl.py to s3://iodp-dc-scripts-dev-165518479671/glue/bronze_etl.py
+Completed 12.4 KiB/12.4 KiB (17.8 KiB/s) with 1 file(s) remainingupload: glue/silver_etl.py to s3://iodp-dc-scripts-dev-165518479671/glue/silver_etl.py
+Completed 4.8 KiB/4.8 KiB (0 Bytes/s) with 1 file(s) remainingupload: glue/dlq_replay.py to s3://iodp-dc-scripts-dev-165518479671/glue/dlq_replay.py
+Completed 5.8 KiB/5.8 KiB (9.5 KiB/s) with 1 file(s) remainingupload: glue/seed_dropzone.py to s3://iodp-dc-scripts-dev-165518479671/glue/seed_dropzone.py
+Completed 11.9 KiB/11.9 KiB (19.2 KiB/s) with 1 file(s) remainingupload: glue/lib.zip to s3://iodp-dc-scripts-dev-165518479671/glue/lib.zip
+=== Done. Uploaded scripts to s3://iodp-dc-scripts-dev-165518479671/glue/ ===
+Using alert email: fredric2010@outlook.com
+=== Preflight 1/2: SKIPPED — 08_freshness_alert.sql not present ===
+  (no SQL in this deploy uses SYSTEM$SEND_EMAIL)
+
+=== Preflight 2/2: checking for existing stateful objects ===
+  probing PIPE...
+    → count=1
+make: *** [Makefile:117: apply-snowflake-sql] Error 1

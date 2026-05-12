@@ -166,10 +166,23 @@ resource "aws_sns_topic_policy" "silver_notifications" {
 resource "aws_s3_bucket_notification" "silver" {
   bucket = aws_s3_bucket.silver.id
 
-  topic {
-    topic_arn     = aws_sns_topic.silver_notifications.arn
-    events        = ["s3:ObjectCreated:*"]
-    filter_prefix = "download_channel/"
+  # S3 bucket notification 直发 Snowflake 自管的 SQS（AUTO_INGEST 模式）：
+  # S3 PUT → Snowflake SQS → Snowpipe COPY。SQS ARN 是动态值，由 Makefile
+  # 的 deploy-infra-phase2 通过 scripts/get_pipe_sqs_arn.sh 提取并通过
+  # -var=snowflake_pipe_sqs_arn=... 注入。
+  #
+  # 为什么不留 topic block 给自家 SNS 监控？AWS S3 不允许同一 event type 上
+  # 两条 prefix 重叠的规则，topic 跟 queue 互斥。Snowpipe ingest 是关键路径，
+  # 优先；自家 SNS+SQS+CloudWatch alarms 变成 dangling resource（不工作但
+  # 也不报错）。Snowpipe-stuck 监控后续改用 Snowflake 端 freshness alert
+  # 实现（snowflake_sql/08_freshness_alert.sql）。
+  dynamic "queue" {
+    for_each = var.snowflake_pipe_sqs_arn != "" ? [1] : []
+    content {
+      queue_arn     = var.snowflake_pipe_sqs_arn
+      events        = ["s3:ObjectCreated:*"]
+      filter_prefix = "download_channel/"
+    }
   }
 
   depends_on = [aws_sns_topic_policy.silver_notifications]
