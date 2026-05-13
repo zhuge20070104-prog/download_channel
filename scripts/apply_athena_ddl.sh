@@ -21,10 +21,12 @@ for ddl_file in "${DDL_DIR}"/*.sql; do
     rendered=$(sed \
         -e "s/\${ENVIRONMENT}/${ENVIRONMENT}/g" \
         -e "s/\${ACCOUNT_ID}/${ACCOUNT_ID}/g" \
+        -e 's/--.*$//' \
         "${ddl_file}")
 
-    # Split on semicolons and execute each statement
-    IFS=';' read -ra STATEMENTS <<< "${rendered}"
+    # Split on semicolons and execute each statement.
+    # read -d '' consumes the whole multi-line buffer (default read stops at \n).
+    IFS=';' read -d '' -ra STATEMENTS <<< "${rendered}" || true
     for stmt in "${STATEMENTS[@]}"; do
         trimmed=$(echo "${stmt}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         # Skip empty or comment-only statements

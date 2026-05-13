@@ -266,6 +266,17 @@ FROM DC_WIDE;
 
 ## 4. Athena Bronze（`dc_narrow` 窄表）
 
+> ⚠️ **`dt` 在 Athena 端是 `STRING`，不是 `DATE`**（见 [athena_ddl/bronze_dc_narrow.sql:15](athena_ddl/bronze_dc_narrow.sql#L15) `PARTITIONED BY (dt STRING, store STRING)`）。
+> Athena/Trino 不会自动把 `varchar` 跟 `date` 互相 cast，所以：
+> - ❌ `WHERE dt = DATE '2026-05-13'`               → `TYPE_MISMATCH: varchar <= date`
+> - ❌ `WHERE dt >= date_add('day', -14, current_date)` → 同上
+> - ✅ `WHERE dt = '2026-05-13'`                    → 字符串比较，且**保留 partition pruning**
+> - ✅ `WHERE dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d')`
+>
+> 注意不要用 `CAST(dt AS DATE) = DATE '...'`——左侧加函数会让 Athena 看不出过滤的是分区列，partition pruning 失效，全表扫。
+>
+> dt 字面量是 `'YYYY-MM-DD'`，字典序 == 时间序，字符串比较与日期比较等价。
+
 ### 4.0 分区登记（首次使用某 dt 时）
 
 ```sql
@@ -286,7 +297,7 @@ SELECT
   MIN(ingest_ts)                      AS first_ingest,
   MAX(ingest_ts)                      AS last_ingest
 FROM iodp_dc_bronze_dev.dc_narrow
-WHERE dt >= date_add('day', -14, current_date)
+WHERE dt >= date_format(date_add('day', -14, current_date), '%Y-%m-%d')
 GROUP BY dt, store
 ORDER BY dt DESC, store;
 ```
@@ -297,7 +308,7 @@ ORDER BY dt DESC, store;
 -- 应该只返回 paid_featured / paid_organic / unpaid_featured / unpaid_organic
 SELECT channel, COUNT(*) AS rows
 FROM iodp_dc_bronze_dev.dc_narrow
-WHERE dt = DATE '2026-05-13'
+WHERE dt = '2026-05-13'
 GROUP BY channel
 ORDER BY rows DESC;
 ```
@@ -315,7 +326,7 @@ FROM (
     dt, product_id, app_store, country, device,
     COUNT(DISTINCT channel) AS channel_count
   FROM iodp_dc_bronze_dev.dc_narrow
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
   GROUP BY 1, 2, 3, 4, 5
 )
 GROUP BY channel_count
@@ -332,7 +343,7 @@ SELECT
   SUM(share_pct) AS share_sum,
   COUNT(*)       AS channel_count
 FROM iodp_dc_bronze_dev.dc_narrow
-WHERE dt = DATE '2026-05-13'
+WHERE dt = '2026-05-13'
 GROUP BY 1, 2, 3, 4, 5
 HAVING ABS(SUM(share_pct) - 1.0) > 0.001
 ORDER BY ABS(SUM(share_pct) - 1.0) DESC
@@ -350,7 +361,7 @@ SELECT
   SUM(CASE WHEN downloads < 0 THEN 1 ELSE 0 END)             AS neg_downloads,
   SUM(CASE WHEN share_pct < 0 OR share_pct > 1 THEN 1 ELSE 0 END) AS oob_share
 FROM iodp_dc_bronze_dev.dc_narrow
-WHERE dt = DATE '2026-05-13';
+WHERE dt = '2026-05-13';
 ```
 
 ### 4.6 重复主键（窄表 PK = dt+product+store+country+device+channel）
@@ -361,7 +372,7 @@ SELECT
   dt, product_id, app_store, country, device, channel,
   COUNT(*) AS dup_count
 FROM iodp_dc_bronze_dev.dc_narrow
-WHERE dt = DATE '2026-05-13'
+WHERE dt = '2026-05-13'
 GROUP BY 1, 2, 3, 4, 5, 6
 HAVING COUNT(*) > 1;
 ```
@@ -369,6 +380,8 @@ HAVING COUNT(*) > 1;
 ---
 
 ## 5. Athena Silver（`dc_wide` 宽表）
+
+> ⚠️ 同 §4 注意：Athena Silver 的 `dt` 也是 `STRING`（[athena_ddl/silver_dc_wide.sql:21](athena_ddl/silver_dc_wide.sql#L21)）。字面量都用 `'2026-05-13'`，不要写 `DATE '2026-05-13'`。
 
 ### 5.1 行数 / 主键唯一
 
@@ -379,7 +392,7 @@ WITH base AS (
     dt, product_id, app_store, country, device,
     COUNT(*) AS cnt
   FROM iodp_dc_silver_dev.dc_wide
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
   GROUP BY 1, 2, 3, 4, 5
 )
 SELECT
@@ -409,7 +422,7 @@ SELECT
            downloads_paid_organic + downloads_unpaid_organic
            THEN 1 ELSE 0 END)                                       AS eq4_violations
 FROM iodp_dc_silver_dev.dc_wide
-WHERE dt = DATE '2026-05-13';
+WHERE dt = '2026-05-13';
 ```
 
 ### 5.3 Share 重算
@@ -428,7 +441,7 @@ SELECT
     / NULLIF(downloads_total, 0), 4
   ) AS featured_share_recalc
 FROM iodp_dc_silver_dev.dc_wide
-WHERE dt = DATE '2026-05-13'
+WHERE dt = '2026-05-13'
   AND downloads_total > 0
   AND (
     ABS(paid_share - ROUND(
@@ -456,13 +469,13 @@ WITH bronze_groups AS (
   FROM (
     SELECT DISTINCT dt, product_id, app_store, country, device
     FROM iodp_dc_bronze_dev.dc_narrow
-    WHERE dt = DATE '2026-05-13'
+    WHERE dt = '2026-05-13'
   )
 ),
 silver_count AS (
   SELECT COUNT(*) AS silver_rows
   FROM iodp_dc_silver_dev.dc_wide
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
 )
 SELECT
   b.bronze_distinct_groups,
@@ -489,7 +502,7 @@ WITH bronze_pivot AS (
     SUM(CASE WHEN channel = 'unpaid_organic'  THEN downloads ELSE 0 END) AS r_uo,
     MIN(COALESCE(is_estimate_final, FALSE))                              AS r_final
   FROM iodp_dc_bronze_dev.dc_narrow
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
   GROUP BY 1, 2, 3, 4, 5
 )
 SELECT
@@ -516,7 +529,7 @@ JOIN bronze_pivot b
  AND s.app_store  = b.app_store
  AND s.country    = b.country
  AND s.device     = b.device
-WHERE s.dt = DATE '2026-05-13'
+WHERE s.dt = '2026-05-13'
   AND (
        s.downloads_total            <> b.r_total
     OR s.downloads_featured         <> b.r_featured
@@ -539,7 +552,7 @@ SELECT b.*
 FROM (
   SELECT DISTINCT dt, product_id, app_store, country, device
   FROM iodp_dc_bronze_dev.dc_narrow
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
 ) b
 LEFT JOIN iodp_dc_silver_dev.dc_wide s
   ON s.dt = b.dt AND s.product_id = b.product_id
@@ -553,12 +566,12 @@ FROM iodp_dc_silver_dev.dc_wide s
 LEFT JOIN (
   SELECT DISTINCT dt, product_id, app_store, country, device
   FROM iodp_dc_bronze_dev.dc_narrow
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
 ) b
   ON s.dt = b.dt AND s.product_id = b.product_id
  AND s.app_store = b.app_store AND s.country = b.country AND s.device = b.device
 WHERE b.product_id IS NULL
-  AND s.dt = DATE '2026-05-13'
+  AND s.dt = '2026-05-13'
 LIMIT 50;
 ```
 
@@ -575,7 +588,7 @@ WITH bronze_share AS (
     SUM(CASE WHEN channel IN ('paid_featured','unpaid_featured')
              THEN share_pct ELSE 0 END) AS b_featured_share
   FROM iodp_dc_bronze_dev.dc_narrow
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
   GROUP BY 1, 2, 3, 4, 5
 )
 SELECT
@@ -588,7 +601,7 @@ FROM iodp_dc_silver_dev.dc_wide s
 JOIN bronze_share b
   ON s.dt = b.dt AND s.product_id = b.product_id
  AND s.app_store = b.app_store AND s.country = b.country AND s.device = b.device
-WHERE s.dt = DATE '2026-05-13'
+WHERE s.dt = '2026-05-13'
   AND (
        ABS(s.paid_share     - b.b_paid_share)     > 0.0002
     OR ABS(s.featured_share - b.b_featured_share) > 0.0002
@@ -606,7 +619,7 @@ LIMIT 50;
 
 ```sql
 -- Athena 侧
-SELECT COUNT(*) FROM iodp_dc_silver_dev.dc_wide WHERE dt = DATE '2026-05-13';
+SELECT COUNT(*) FROM iodp_dc_silver_dev.dc_wide WHERE dt = '2026-05-13';
 
 -- Snowflake 侧
 SELECT COUNT(*) FROM IODP_DC_DEV.SILVER.DC_WIDE WHERE dt = '2026-05-13';
@@ -896,14 +909,14 @@ WITH bronze_recalc AS (
     SUM(CASE WHEN channel = 'unpaid_featured' THEN downloads ELSE 0 END) AS r_uf,
     SUM(CASE WHEN channel = 'unpaid_organic'  THEN downloads ELSE 0 END) AS r_uo
   FROM iodp_dc_bronze_dev.dc_narrow
-  WHERE dt = DATE '2026-05-13'
+  WHERE dt = '2026-05-13'
   GROUP BY 1, 2, 3, 4, 5
 ),
 mismatch AS (
   SELECT COUNT(*) AS pivot_mismatch
   FROM iodp_dc_silver_dev.dc_wide s
   JOIN bronze_recalc b USING (dt, product_id, app_store, country, device)
-  WHERE s.dt = DATE '2026-05-13'
+  WHERE s.dt = '2026-05-13'
     AND (s.downloads_total          <> b.r_total
       OR s.downloads_featured       <> b.r_featured
       OR s.downloads_paid_featured  <> b.r_pf

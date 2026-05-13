@@ -5589,3 +5589,236 @@ senior 跟 mid-level DE 的区别就在这——后者按文档抄一遍，senio
 - 只进 S3+Athena？可行，省钱但 BI 体验差，没有 dedup/MERGE ⚠️
 - S3 + Snowflake 双写？贵 ~$200/月（dev 规模），但功能完整 + portfolio 加分 ✅（本项目）
 
+---
+
+## q) SQL 速记：`GROUP BY 1, 2, 3, 4, 5` 是什么意思
+
+[TEST.md](TEST.md) 里大量出现 `GROUP BY 1, 2, 3, 4, 5` 这种写法，例如主键唯一性校验：
+
+```sql
+SELECT
+  dt, product_id, app_store, country, device,   -- 第 1..5 列
+  COUNT(*) AS dup_count                          -- 第 6 列（聚合，不能进 GROUP BY）
+FROM DC_WIDE
+GROUP BY 1, 2, 3, 4, 5
+HAVING COUNT(*) > 1;
+```
+
+### 含义
+
+数字是 **SELECT 列表中列的位置序号**（1-based），上面等价于：
+
+```sql
+GROUP BY dt, product_id, app_store, country, device
+```
+
+ANSI SQL 标准的一部分，Snowflake、Athena/Presto、PostgreSQL、BigQuery 都支持。
+
+### 为什么用数字而不是列名
+
+| 写法 | 优点 | 缺点 |
+|------|------|------|
+| `GROUP BY 1, 2, 3, 4, 5` | 简洁；SELECT 列是表达式时不用重复写（如 `DATE_TRUNC('week', dt)`） | 改 SELECT 顺序会**静默**改变分组语义 |
+| `GROUP BY dt, product_id, ...` | 显式、改列顺序安全；review 友好 | 表达式列要写两遍 |
+
+### 在本项目中的常见位置
+
+- [TEST.md:215](TEST.md#L215) — Snowflake 主键唯一性校验
+- [TEST.md:319](TEST.md#L319) — Bronze 窄表每 group 必须 4 个 channel
+- [TEST.md:493](TEST.md#L493) — Bronze → Silver pivot 行级对账（核心校验）
+- [TEST.md:674](TEST.md#L674) — Gold `DC_DAILY_BY_APP` 与 Silver 对账
+
+全部都是"前 N 列分组、后续列聚合"的模式速记。在 DQ 校验场景里这种写法尤其常见，因为分组键就是表的主键列，顺序与 SELECT 完全一致。
+
+### 实操建议
+
+- **临时查询 / DQ 校验**：用数字省事，列短改 SELECT 的概率低
+- **进库的 ETL / Dynamic Table / dbt model**：写列名。一旦 SELECT 列顺序变了，按数字写的 GROUP BY 不会报错但语义错了——这是经典的"静默 bug"来源
+- **PR review 时**：看到 `GROUP BY 1, 2, 3` 优先看 SELECT 前 N 列是不是真正的分组键
+
+---
+
+## r) `apply_athena_ddl.sh` 假装成功的两个 bash bug
+
+**症状**：Athena 控制台 `SHOW PARTITIONS iodp_dc_bronze_dev.dc_narrow` 报 `Table not found`。左侧 **Tables (0)**。但跑 [scripts/apply_athena_ddl.sh](scripts/apply_athena_ddl.sh) 输出明明是：
+
+```
+--- Executing bronze_dc_narrow.sql ---
+--- Done: bronze_dc_narrow.sql ---
+--- Executing silver_dc_wide.sql ---
+--- Done: silver_dc_wide.sql ---
+=== All Athena DDL applied successfully ===
+```
+
+看着 100% 成功，Glue 里却一张表都没有。
+
+### 关键诊断信号
+
+**输出里没有任何 `Query started: <id>` 行**——脚本里每条 statement 真的发给 Athena 时会打一行 query ID。一条都没有 → 一条 SQL 都没真的执行。Athena CLI 根本没被调用，自然也不会失败。
+
+这种"安静的成功"（silent success）比报错危险得多，因为 `set -euo pipefail` + 退出码 0 + 包装话术 "applied successfully" 会让 CI / 下游运维完全相信。
+
+### Bug #1：`read -ra <<<` 只读第一行
+
+原脚本 [scripts/apply_athena_ddl.sh:27](scripts/apply_athena_ddl.sh#L27)（修复前）：
+
+```bash
+IFS=';' read -ra STATEMENTS <<< "${rendered}"
+```
+
+bash 的 `read` 默认遇到 `\n` 就停。herestring `<<<` 把多行字符串喂进 stdin，但 `read` 只消费**第一行**。
+
+我们的 DDL 文件第一行是注释：
+
+```sql
+-- athena_ddl/bronze_dc_narrow.sql       ← 第一行
+-- Bronze narrow table for Athena ad-hoc queries
+
+CREATE EXTERNAL TABLE IF NOT EXISTS ...  ← 第一行之后全被丢弃
+```
+
+所以 `STATEMENTS` 数组里只有一个元素 `-- athena_ddl/bronze_dc_narrow.sql`，CREATE TABLE 跟 MSCK REPAIR 整段都没进数组。
+
+### Bug #2：注释检查吞掉多行 statement
+
+哪怕 Bug #1 修了，原来的注释跳过逻辑还有问题：
+
+```bash
+if [ -z "${trimmed}" ] || [[ "${trimmed}" == --* ]]; then
+    continue
+fi
+```
+
+`[[ "${trimmed}" == --* ]]` 是 shell glob 匹配，只看字符串**开头**。但 split-by-`;` 之后第一个 chunk 长这样：
+
+```
+-- athena_ddl/bronze_dc_narrow.sql
+-- Bronze narrow table for Athena ad-hoc queries
+
+CREATE EXTERNAL TABLE IF NOT EXISTS iodp_dc_bronze_dev.dc_narrow (
+    ...
+) TBLPROPERTIES ('parquet.compression'='SNAPPY')
+```
+
+整段 trim 后**还是**以 `--` 开头——CREATE TABLE 跟着注释一起被 continue 了。
+
+### 修复方式
+
+两个 bug 同时改：
+
+```bash
+rendered=$(sed \
+    -e "s/\${ENVIRONMENT}/${ENVIRONMENT}/g" \
+    -e "s/\${ACCOUNT_ID}/${ACCOUNT_ID}/g" \
+    -e 's/--.*$//' \                                      # ← 渲染时直接剥行注释
+    "${ddl_file}")
+
+IFS=';' read -d '' -ra STATEMENTS <<< "${rendered}" || true
+#               ^^^^                              ^^^^^^^
+#       NUL 当分隔符 → 读到 EOF 才停           读到 EOF 返回非零，吃掉避免 set -e 退出
+```
+
+- **`sed 's/--.*$//'`**：把每行 `--` 到行尾的内容删掉，split 之前 SQL 里就没有 `--` 注释了，第二个 bug 消失
+- **`read -d ''`**：把 read 的分隔符从默认 `\n` 改成 NUL byte，herestring 不含 NUL → read 一直读到 EOF，整个多行 buffer 全进数组，第一个 bug 消失
+- **`|| true`**：read 读到 EOF 没找到 NUL 会返回 1，配合 `set -euo pipefail` 会让脚本退出。`|| true` 显式吞掉这个预期的非零退出码
+
+### 这事的教训
+
+- **shell 脚本静默失败比报错严重**——`set -euo pipefail` 只能拦"命令返回非零"，拦不住"循环 0 次空转"。CI 里要么校验副作用（这里：跑完后 `aws glue get-tables` 期望非空），要么校验 query count（脚本结束时断言至少跑过 N 条 SQL）
+- **`read -ra <<<` 处理多行内容是反模式**——bash 圈子里更稳的写法是 `mapfile -t LINES < <(echo "$rendered")` 或者 `read -d ''`。herestring + 默认 read 适合单行 token 拆分，不适合多 statement SQL
+- **DDL 跟运维脚本要一起在 fresh env 演练**——这段代码我之前在 dev 跑过，但跑的时候 Glue 已经有表了（terraform 早期手动建过），`MSCK REPAIR TABLE` 在 us-east-1 偶然能跑通，把 bug 掩盖了。这次彻底拆掉重建才暴露
+- **诊断顺序**：表不存在 → 先在脚本输出里**搜 query ID**，没有就说明 SQL 没发出去，问题在 shell 解析；有 query ID 但失败，才去 region / IAM / S3 location 上查
+
+参见 [TEST.md:269](TEST.md#L269) 的 "分区登记（首次使用某 dt 时）" 一节——只要表创建对了，`MSCK REPAIR` 是常规手段，不是这次问题的根因。
+
+---
+
+## s) 跑完 TEST.md 全部 Athena 查询要花多少钱
+
+**结论先讲**：在本项目 dev 规模下，跑完 [TEST.md](TEST.md) 里所有 ~16 条 Athena 查询的成本是 **0.001-0.01 美元（几厘到 1 美分）**。Snowflake 部分加起来 < $0.10。整套 portfolio 校验跑一遍**不到一毛钱**。
+
+### Athena 计费规则
+
+- **$5 / TB scanned**（2026 价格，ap-southeast-1）
+- **单查询最低 10 MB**——表再小也按 10 MB 算
+- 元数据查询免费（`SHOW PARTITIONS` / `MSCK REPAIR` / `DESCRIBE`）
+
+### TEST.md 里 Athena 查询的清单（约 16 条）
+
+| 节 | 查询数 | 单次扫描范围 | 备注 |
+|----|--------|-------------|------|
+| §4.0 | 2 | 0 字节 | 元数据，**不计费** |
+| §4.1 | 1 | 14 天 × 2 store = 28 分区 | 全文件**最贵**的范围查询 |
+| §4.2–§4.6 | 5 | 1 天 × 2 store = 2 分区 | partition pruning 生效 |
+| §5.1–§5.3 | 3 | 1 天 × 2 store | Silver |
+| §6.1–§6.4 | 4 | Bronze + Silver 各 2 分区 | 跨层对账 |
+| §7.1–§7.2 | 2 | §7.1 单 dt；**§7.2 全表** | §7.2 没 WHERE，prod 慎跑 |
+| §B 附录 | 1 | Bronze + Silver 各 2 分区 | smoke test |
+
+### 三种数据规模的总成本估算
+
+| 场景 | 单分区压缩 Parquet | 16 条总扫描量 | 成本 |
+|------|------------------|-------------|------|
+| **A. 本项目 dev**（测试数据几 KB-MB） | 1-10 KB | < 160 MB（多数被 10MB 地板兜底）| **~$0.001** |
+| **B. 中等 dev / 真实回测** | ~10 MB | ~1 GB | **~$0.005** |
+| **C. 生产规模** | ~1 GB | ~100 GB + §7.2 全表 | **$0.5-2** |
+
+### 为什么本项目这么便宜——4 个叠加因素
+
+1. **数据小**：dev 每分区几 KB-MB，扫不到几 GB
+2. **Parquet 列式存储**：DDL 用 `STORED AS PARQUET`，SELECT 只用几列时只读那几列的 column chunk
+3. **分区裁剪生效**：TEST.md 几乎所有查询都有 `WHERE dt = '...'`，只读 1-2 个分区
+4. **10 MB 最低计费反向兜底**：再"贵"也贵不到哪去——16 条 × 10 MB = 160 MB ≈ $0.0008
+
+> 关键设计选择都在 DDL：[athena_ddl/bronze_dc_narrow.sql](athena_ddl/bronze_dc_narrow.sql) 第 15 行 `PARTITIONED BY (dt STRING, store STRING)` + 第 16 行 `STORED AS PARQUET`。这两个一起决定了 Athena 单次查询永远不会超过单分区的列子集。
+
+### Athena 啥时候会"突然贵"——本项目避坑清单
+
+| 反模式 | 后果 | 本项目防御 |
+|--------|------|----------|
+| `SELECT *` 没 WHERE | 全表全列扫，TB 数据立刻 $5+ | TEST.md 全部带 WHERE 跟具体列 |
+| `CAST(partition_col AS X) = Y` | partition pruning 失效，全分区扫 | §r [TEST.md:269](TEST.md#L269) 顶部已经写了警示框 |
+| JOIN 不限时间窗 | 两边都全表扫 | §6 / §B 的 JOIN 都带 `WHERE dt = '...'` |
+| CSV/JSON 格式 | 没列裁剪，SELECT 一列也读全部 | DDL 用 Parquet |
+| §7.2 全表 `GROUP BY dt` | dev 几 MB 没事，prod 几百 GB | 文档上单独标注 prod 加 `WHERE dt >= ...` |
+
+### Athena vs Snowflake 成本对比（同一份 TEST.md 校验）
+
+| 维度 | Athena 部分 | Snowflake 部分 |
+|------|------------|---------------|
+| 计费模型 | 按扫描字节 | 按 warehouse 运行时间 |
+| dev 单次跑 16 条 | ~$0.001 | XS 仓启动 + 跑 ~30 条 ≈ 1-2 分钟 = $0.03-0.07 |
+| 反复查同一表 | 每次都重新扫，**不省** | result cache 24h 免费 |
+| Dynamic Table 维持成本 | 不涉及 | 后台刷新算 warehouse 时间，[explanation.md:478](explanation.md#L478) §e 成本护栏限制 |
+
+整个 TEST.md 全跑一遍 dev：Athena ≈ $0.001 + Snowflake ≈ $0.05 + Dynamic Table 刷新分摊 ≈ $0.02 ≈ **< $0.10**。
+
+### 怎么实时看每条查询花了多少钱
+
+Athena 控制台：查询完成后右下角 **Data scanned: X.X MB**。把这数字 × $5 / 1024 / 1024 = 这条查询的美元成本。
+
+```
+0.5 MB scanned → $5 × (0.5 / 1024 / 1024) ≈ $0.0000024  → 实际按 10MB 计 = $0.00005
+10 MB scanned  → $0.00005
+1 GB scanned   → $0.005
+1 TB scanned   → $5
+```
+
+dev 跑 16 条总和如果超过 100 MB，就要查是不是哪条没走 partition pruning（典型：[TEST.md:269](TEST.md#L269) 警示的 `CAST(dt AS DATE)` 反模式）。
+
+### Snowflake 这边何时会"突然贵"
+
+跟 Athena 完全不同的模型——按 warehouse 时间，所以坑也不一样：
+
+- **大仓查小数据**：用 LARGE 仓跑一条 1 秒的查询也按 1 分钟 = $0.27（X-Small 仓 $0.04 起，size 翻倍价格翻倍）
+- **没设 AUTO_SUSPEND**：仓库 24 小时挂着 = $1.50-50 / 天 取决于 size
+- **Dynamic Table TARGET_LAG 过短**：[snowflake_sql/05_gold_dynamic_tables.sql] 里设的 LAG 决定刷新频率，1 minute LAG 会让仓库几乎不停
+- **跨账户 storage scan 流量费**：Snowpipe COPY 时如果 stage 跟仓库不同 region，要付跨 region 流量
+
+本项目防御：[snowflake_sql/02_warehouse_alert.sql] 设了 X-Small + AUTO_SUSPEND=60s + RESOURCE_MONITOR 5 credit/day 上限——见 [explanation.md:478](explanation.md#L478) §e 成本护栏。
+
+### 一句话总结
+
+**Athena 计费按扫描字节，所以"小数据 + Parquet + partition pruning"三件套让本项目跑校验的成本无限趋近于 0。** 真正要警惕的是 prod 规模 + 反模式查询（全表扫、左侧 cast、CSV 格式），单条就能跑出 $5+。
+
+
