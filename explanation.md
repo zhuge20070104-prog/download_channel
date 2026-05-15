@@ -5821,4 +5821,411 @@ dev 跑 16 条总和如果超过 100 MB，就要查是不是哪条没走 partiti
 
 **Athena 计费按扫描字节，所以"小数据 + Parquet + partition pruning"三件套让本项目跑校验的成本无限趋近于 0。** 真正要警惕的是 prod 规模 + 反模式查询（全表扫、左侧 cast、CSV 格式），单条就能跑出 $5+。
 
+---
+
+## n) 跨仓数据校验（Glue Silver ↔ Snowflake Silver Parity Check）
+
+> 本节回答：当同一份 Silver 数据既落在 Glue/S3（Athena 查询）又落在 Snowflake，怎么验证两边数据一致？
+
+### 这是什么
+
+ETL 双写之后的 **数据正确性自检**：相同 `dt` 分区下，Glue 侧的 [silver.dc_wide](athena_ddl/silver_dc_wide.sql) 和 Snowflake 侧的 [SILVER.DC_WIDE](snowflake_sql/03_silver_table.sql) 应该是同一份数据。任何 ETL bug（行丢失、字段错位、精度截断、NULL 变 0）都应该在这一关被抓出来。
+
+### 为什么需要
+
+[TEST.md:624-626](TEST.md#L624-L626) 当前是手工 SQL 验证：
+
+```sql
+-- Snowflake 侧
+SELECT COUNT(*) FROM IODP_DC_DEV.SILVER.DC_WIDE WHERE dt = '2026-05-13';
+```
+
+只对行数。**行数对不代表数据对**：
+
+- 字段值悄悄错位（A 列写到 B 列）→ COUNT 抓不到
+- 浮点精度截断（0.1234 变 0.1230）→ COUNT 抓不到
+- NULL 被默默替换成 0 → COUNT 抓不到
+
+要自动化、可信、跑得起，就需要专门的 parity check 脚本。
+
+---
+
+### 方案选型：为什么不用 Athena Federated / EMR
+
+考虑过三个方案：
+
+| 方案 | 原理 | 适合场景 | 本项目是否合适 |
+|------|------|---------|--------------|
+| **Athena Federated Query** | Lambda Snowflake connector，Athena SQL 直接 JOIN Snowflake 表 | 偶尔轻量校验 | ⚠️ Lambda 15 min 超时 + 内存限制，predicate pushdown 有限 |
+| **EMR + Spark Snowflake Connector** | EMR 起 Spark 集群，跨源 JOIN，支持 query pushdown | TB 级跨源 JOIN | ❌ 成本爆炸（见下） |
+| **Python 脚本 + 三层抽样** | Athena 跑聚合 + Snowflake 跑聚合 + pandas 做行级 diff | 中小数据量 + 灵活逻辑 | ✅ **本项目选这个** |
+
+#### EMR 成本（为什么不用）
+
+| 组件 | 最小成本 |
+|------|--------|
+| EMR Serverless | ~$0.05/vCPU-hr + $0.005/GB-hr，最小起步几美元/天 |
+| EMR on EC2 | m5.xlarge × 3 节点 ≈ **$0.6/小时**，常驻 = $430/月 |
+| EMR on EKS | 还要再加 EKS control plane $73/月 |
+
+EMR 是为 **TB 级数据 + 长跑批处理** 设计的。本项目 1 file/day、Silver 单分区 MB~GB 级，**Spark cluster 启动开销比实际计算还大**。ROI 极差。
+
+#### Athena Federated 的坑
+
+```
+Athena SQL
+  ├── Glue Catalog 表 (S3 Parquet)  ← 原生
+  └── Snowflake 表  ← 通过 Lambda Connector (AthenaSnowflakeConnector)
+```
+
+- Lambda 15 分钟超时 → 大表 JOIN 容易挂
+- Snowflake 侧每次查询消耗 warehouse credit
+- Predicate pushdown 不全，可能拉全表回 Lambda 再过滤
+- 多套一层 Lambda + Secrets Manager 维护成本
+
+**对 1 file/day 的项目，纯 Python 脚本各自查、本地比对反而最务实。**
+
+---
+
+### 三层校验设计
+
+按"便宜的先跑、贵的失败时才跑"的顺序：
+
+| Layer | 查询代价 | 抓什么 bug | 何时触发 |
+|-------|--------|----------|---------|
+| **L1: COUNT + row checksum** | 1 个聚合查询 | 行数错位、任意 exact 列字段值差 | 每天必跑 |
+| **L2: SUM/SUMSQ/MIN/MAX/NULL_CNT** | 同上（合并到 L1 一个 SQL） | 浮点列异常、NULL 数量异常 | 每天必跑 |
+| **L3: 抽样 1000 行 pandas merge** | 1 次抽样 + 1 次 PK 点查 | 定位具体行/列出错 | **仅 L1/L2 失败时** |
+
+L1+L2 合并到一个 SQL 跑两边，传输回 Python 的只有几个数字。L3 只在前两层报错时启动。
+
+---
+
+### Layer 1: SUM(MD5 hash) checksum 原理
+
+**核心思想**：不传明细数据，只传"指纹"。
+
+1. 把每行所有 exact 列拼成一个字符串
+2. 算 MD5 → 一个 128 bit 数字
+3. 把这天所有行的 MD5 **加起来** → 一个大整数
+4. 两边各算这个数，比对相不相等
+
+```
+Glue 1M 行           Snowflake 1M 行
+  ├─ row1: MD5 = a    ├─ row1: MD5 = a
+  ├─ row2: MD5 = b    ├─ row2: MD5 = b   (行序可能不同)
+  └─ ...              └─ ...
+       │                       │
+       SUM = a+b+c+...          SUM = a+b+c+...
+              \               /
+               \             /
+                比较：相等？
+```
+
+**为什么用 SUM 不用 ARRAY_AGG / 拼接？**
+
+- 加法**可交换**：`a+b = b+a`，行序不影响结果（两边并行扫描行序大概率不同）
+- 拼接不可交换：`"ab" ≠ "ba"`，会假阳性
+
+**为什么用 MD5 不用各引擎原生 HASH？**
+
+| 函数 | Athena | Snowflake | 跨引擎一致？ |
+|------|--------|-----------|------------|
+| `HASH()` | 不存在 | 有 | ❌ |
+| `xxhash64()` | 有 | 不存在 | ❌ |
+| **`MD5()`** | 有 | 有 | ✅ **算法标准，输出位级一致** |
+
+**为什么取 MD5 前 15 个 hex 字符？**
+
+- MD5 输出 128 bit = 32 个 hex 字符，太大 SUM 会溢出
+- 15 个 hex = 60 bit，可装进 BIGINT（63 bit），SUM 千万行也不溢出
+- 碰撞概率 2⁻⁶⁰ ≈ 10⁻¹⁸，对一天 1M 行的校验完全够用
+
+---
+
+### Layer 1 的隐藏坑：浮点序列化让 MD5 失效
+
+**MD5 对字节敏感**。同一个浮点数在不同引擎里序列化成字符串可能不一样：
+
+| 同一个数 | Glue/Trino 输出 | Snowflake 输出 |
+|---------|---------------|---------------|
+| `1.5` | `1.5` | `1.500000` |
+| `0.1 + 0.2` | `0.30000000000000004` | `0.3` |
+| `1e10` | `1.0E10` | `10000000000` |
+
+→ MD5 不一致，校验永远 fail。
+
+**解决方案**：浮点列**不进 MD5**，单独做容差比对。这就是为什么有 Layer 2。
+
+---
+
+### Layer 2: 浮点容差校验（不逐行 + 多统计量联合）
+
+#### 为什么不逐行做容差
+
+| 方案 | 数据传输 | 计算成本 | 能抓到的 bug |
+|------|--------|--------|------------|
+| 逐行 diff | O(N) 行 | 高 | 100% 行级差异 |
+| **SUM+SUMSQ+MIN+MAX+NULL_CNT** | O(1) 行 | 极低 | ≥99% 行级差异 |
+| 抽样 1000 行 diff | O(1000) | 低 | 80% 局部差异 |
+
+逐行容差对 1M 行表要传 1M 次结果回 Python，成本爆炸。聚合 5 个统计量只传 5 个数字。
+
+#### 单 SUM 容差的伪造空间
+
+假设有 1M 行，每行 `paid_share` 是 [0,1) 之间的定点数：
+
+- Glue 行 A = 0.5001，Snowflake 行 A = 0.5002（差 +0.0001）
+- Glue 行 B = 0.5002，Snowflake 行 B = 0.5001（差 -0.0001）
+- **SUM 完全相等，但实际行级数据不一致**
+
+单 SUM 容错有伪造空间。怎么堵？**多统计量联合**：
+
+| 单一指标 | 能被偶然抵消吗？ |
+|---------|----------------|
+| `SUM(x)` | 容易：+ε 和 -ε 抵消 |
+| `SUM(x) + SUM(x²)` | 难：等价"均值和方差都一致"，需要刻意构造 |
+| `SUM(x) + SUM(x²) + MIN(x) + MAX(x) + COUNT(NULL)` | 几乎不可能在 ETL 偶然 bug 下全部抵消 |
+
+加上 Layer 3 抽样兜底，**剩下 1% 漏网概率也能 catch**。
+
+---
+
+### 三大跨引擎陷阱（针对 DC_WIDE 实际 schema）
+
+#### 陷阱 1：DECIMAL(6,4) 单值精度 vs SUM 累加顺序
+
+DC_WIDE 实际**没有真正的浮点列**：
+
+| 列 | Athena | Snowflake | 风险 |
+|----|--------|-----------|------|
+| 8 个 downloads_* | BIGINT | NUMBER(38,0) | 整数零风险 |
+| `paid_share` | **DECIMAL(6,4)** | **NUMBER(6,4)** | 定点数 4 位小数 |
+| `featured_share` | **DECIMAL(6,4)** | **NUMBER(6,4)** | 同上 |
+
+**单值精度（理论一致）**：
+- Athena/Trino 和 Snowflake 的 `DOUBLE` 都是 **IEEE 754 binary64**
+- `DECIMAL(6,4) → DOUBLE` 是 **round-to-nearest-even**，**确定性算法**
+- → 单个值的 cast 位级相同
+
+**MIN/MAX（理论上严格相等）**：
+- 用原生 DECIMAL（不 cast 成 DOUBLE）
+- 只选一个值，不做算术 → 真实数据层面严格相等
+
+**SUM 才是真不确定的**：
+- `SUM(DOUBLE)` 在并行执行时**累加顺序不固定**
+- 浮点加法不满足结合律：`(a+b)+c ≠ a+(b+c)` 在最后一 bit 上
+- Athena 多 worker、Snowflake 多 micro-partition，累加顺序各自不同
+- 累计误差 ≈ `N × ε × max(|x|)`，1M 行 × DECIMAL(6,4) ≈ 1e-10 量级
+- **这就是为什么 SUM 必须用相对误差 1e-6 容差**
+
+#### 陷阱 2：TIMESTAMP 精度不同
+
+- Athena TIMESTAMP 默认 ms (毫秒)
+- Snowflake TIMESTAMP_NTZ 默认 ns (纳秒)
+- 直接比 hash 永远不等
+
+**解决**：两边都 `DATE_TRUNC('SECOND', ingest_ts)` 截到秒。业务上 ETL 时间戳精度到秒足够。
+
+#### 陷阱 3：CHAR(2) 右填空格
+
+- Snowflake `country CHAR(2)` 存 'A' 会变 `'A '`（右填空格）
+- Athena STRING 保留 'A'
+- → 直接拼字符串、算 MD5，结果不同
+
+**解决**：两边都 `RTRIM(country)` 强制对齐。
+
+#### 陷阱 4：Python 类型 marshaling 假阳性
+
+代码里用 `!=` 比较 MIN/MAX 会出 bug：
+
+- Athena 走 CSV 回 pandas → 自动 parse 成 `float`
+- Snowflake connector 返回 `decimal.Decimal('0.5000')`
+- `Decimal('0.5000') != 0.5` 在 Python 里行为不一致
+
+**解决**：在入口统一 `float(v)`，MIN/MAX 比较给 1e-9 极小容差兜底（本质上还是 exact）。
+
+---
+
+### Schema 分类逻辑
+
+针对 [silver_dc_wide.sql](athena_ddl/silver_dc_wide.sql) 和 [03_silver_table.sql](snowflake_sql/03_silver_table.sql)：
+
+```python
+SCHEMA = {
+    # 复合主键（dt 已在 WHERE 固定）
+    "pk_cols": ["product_id", "app_store", "country", "device"],
+
+    # 精确比对列（进 MD5 row checksum）
+    "exact_cols": [
+        "product_id", "app_store", "country", "device",
+        "downloads_total", "downloads_featured", "downloads_organic",
+        "downloads_paid_featured", "downloads_paid_organic",
+        "downloads_unpaid_featured", "downloads_unpaid_organic",
+        "is_estimate_final",
+        "ingest_ts",  # 截到秒
+    ],
+
+    # 容差比对列（SUM/SUMSQ/MIN/MAX/NULL_CNT）
+    "tolerance_cols": ["paid_share", "featured_share"],
+
+    # 排除（Snowflake 才有 / Glue partition only）
+    "exclude": ["_loaded_at", "store"],
+}
+```
+
+**注意 schema 不对等点**：
+- Athena 有 `store` 分区字段，Snowflake 没有 → 校验时跳过
+- Snowflake 有 `_loaded_at` 默认列，Athena 没有 → 校验时跳过
+
+---
+
+### Layer 3: pandas merge 逐行讲解
+
+> 这部分是面试常被追问的细节：pandas merge + outer + suffix + indicator + mask，逐步拆开。
+
+#### 数据流
+
+```
+g_df (1000 行抽样 from Glue)       s_df (用 g_df 的 PK 从 SF 精确捞)
+  ├─ product_id, app_store, ...     ├─ product_id, app_store, ...
+  ├─ paid_share                     ├─ paid_share
+  └─ ...                            └─ ...
+              │                                 │
+              └──────── pandas merge ───────────┘
+                       on PK cols, outer
+                              │
+                              ▼
+                merged (一个大 DataFrame)
+       PK 列     | paid_share_glue | paid_share_sf | _merge
+       ---------|-----------------|---------------|--------
+       (1,a,b,c)|   0.1234        |  0.1234       | both
+       (2,a,b,c)|   0.5000        |  0.5001       | both       ← 真差异
+       (3,a,b,c)|   0.7000        |  NaN          | left_only  ← 只在 Glue
+```
+
+#### merge 参数逐个解释
+
+```python
+merged = g_df.merge(
+    s_df, on=SCHEMA["pk_cols"], how="outer",
+    suffixes=("_glue", "_sf"), indicator=True,
+)
+```
+
+- **`on=["product_id","app_store","country","device"]`**：复合主键 join。这 4 列在两个 DataFrame 里**值完全相同**才能 join 上。
+- **`how="outer"`**：全外连接。左右两边任何一边有的行都保留。inner join 会丢掉 "只在一边出现" 的行 → 抓不到 "Glue 多了一行" 这种 bug。
+- **`suffixes=("_glue", "_sf")`**：非 PK 列重名时加后缀。`paid_share` 变成 `paid_share_glue` 和 `paid_share_sf`。
+- **`indicator=True`**：加一列 `_merge` 标记来源：`left_only` / `right_only` / `both`。
+
+#### tolerance 容差比对每一行
+
+```python
+both = merged[merged["_merge"] == "both"]
+```
+过滤出两边都有的行（只有两边都有的行才能比较字段值，"只在一边"的行已经单独标记）。
+
+```python
+g_v, s_v = both[f"{c}_glue"].astype(float), both[f"{c}_sf"].astype(float)
+```
+取出 `paid_share_glue` 和 `paid_share_sf` 两个 Series，统一转 float（消除 Decimal vs float 类型坑）。
+
+```python
+denom = pd.concat([g_v.abs(), s_v.abs(), pd.Series(1.0, index=g_v.index)], axis=1).max(axis=1)
+```
+
+这行最绕，**逐步拆**：
+
+1. `g_v.abs()` = `|paid_share_glue|`，一个 Series
+2. `s_v.abs()` = `|paid_share_sf|`，一个 Series
+3. `pd.Series(1.0, index=g_v.index)` = 全是 1.0 的 Series
+
+横向拼成 3 列 DataFrame，`.max(axis=1)` 每行取 3 列的最大值：
+
+```
+index | |g_v| | |s_v| | 1.0  | denom
+------|------|------|------|-------
+  0   | 0.12 | 0.12 | 1.0  | 1.0
+  1   | 0.50 | 0.50 | 1.0  | 1.0
+```
+
+**为什么 + 1.0？** 标准相对误差公式 `|a-b|/max(|a|,|b|)` 在 a=b=0 时除零。加 1.0 作下限保证分母 ≥ 1。对 `paid_share` 这种 [0,1) 区间小数，denom 永远是 1.0，相对误差退化成绝对误差——但 4 位小数精度本身就是 1e-4，1e-6 容差对它已经很严格。
+
+```python
+bad_mask = (g_v - s_v).abs() / denom > TOLERANCE
+```
+向量化布尔运算：每行的 `|g-s|/denom > 1e-6` → 返回布尔 Series。
+
+```python
+bad = both[bad_mask]
+```
+用布尔 mask 选行，留下所有超容差的行。
+
+---
+
+### 完整代码
+
+落地到 [scripts/validate_parity.py](scripts/validate_parity.py)，三层一起跑：
+
+```bash
+export SF_USER=... SF_PASSWORD=... SF_ACCOUNT=... SF_WAREHOUSE=IODP_DC_WH_DEV
+python scripts/validate_parity.py 2026-05-13
+```
+
+输出示例：
+
+```
+[parity] dt=2026-05-13
+[parity] PASS  rows=12345
+```
+
+或失败时：
+
+```
+[parity] FAIL  Layer 1/2:
+  [L1] row_checksum mismatch (some exact-col value differs)
+  [L2] paid_share_sum rel_diff>1e-06: glue=12345.6789 sf=12345.6790
+[parity] running Layer 3 sample diff...
+[parity] 3 mismatched sample rows:
+  ...
+```
+
+---
+
+### 三层成本对比（对 1 file/day 量级）
+
+| Layer | Athena 扫描 | Snowflake credit | 触发时机 | 估算 $ |
+|-------|-----------|------------------|---------|-------|
+| L1+L2（聚合）| 1 个分区（< 10 MB）| 1 个 warehouse query | **每天必跑** | < $0.001 + ~$0.04 |
+| L3（抽样 1000 行）| 1 个分区 + 1% sample | + 1 个点查 | **仅失败时** | < $0.001 + ~$0.04 |
+
+正常情况一次校验 < **$0.05**。
+
+---
+
+### 为什么不用 dbt
+
+考虑过 [dbt-utils.equal_rowcount](https://github.com/dbt-labs/dbt-utils) / [dbt_expectations.expect_table_aggregation_to_match_another_table](https://github.com/calogica/dbt-expectations) 来包装这套校验。**本项目暂不引入**：
+
+- 项目目前没有 dbt，引入 dbt 是另一个工作量
+- 抽样校验是工业界标准做法（Netflix / Airbnb 的 data quality framework 底层也是这套），**没有 dbt 不算 low**
+- 没有 dbt 反而**逻辑更透明**，简历上写 "built custom cross-warehouse data parity validation in Python" 一样有说服力
+- 引入 dbt 是 [DE 转型 portfolio 加分](memory/project_de_career_transition.md) 的下一步选项，但**不阻塞当前校验落地**
+
+---
+
+### 一句话总结
+
+**MD5 hash 抓字段值错位，多统计量联合抓浮点误差，抽样 pandas merge 抓具体行——三层叠加，单次校验 < $0.05，能 catch 99% 的 ETL bug，剩下 1% 用 Layer 3 抽样兜底。**
+
+关键设计选择：
+
+1. **不跨仓 JOIN**（不用 Athena Federated、不用 EMR）→ 成本可控
+2. **MD5 而非 HASH/xxhash64** → 跨引擎一致性
+3. **浮点列不进 MD5** → 避开浮点序列化坑
+4. **SUM + SUMSQ + MIN + MAX + NULL_CNT 多统计量** → 单 SUM 伪造空间被堵
+5. **类型在入口统一归一化（float / int）** → 避开 Python Decimal vs float 假阳性
+6. **L3 只在 L1/L2 失败时触发** → 99% 情况下成本极低
+
+
 
