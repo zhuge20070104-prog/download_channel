@@ -95,6 +95,14 @@ resource "aws_iam_role_policy" "glue_dc_policy" {
         Resource = ["arn:aws:logs:*:*:*"]
       },
       {
+        Sid    = "CloudWatchMetrics"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData",
+        ]
+        Resource = ["*"]
+      },
+      {
         Sid      = "SNSPublish"
         Effect   = "Allow"
         Action   = ["sns:Publish"]
@@ -131,6 +139,9 @@ resource "aws_glue_job" "bronze_etl" {
     "--enable-auto-scaling"                = "true"
     "--enable-metrics"                     = "true"
     "--enable-continuous-cloudwatch-log"    = "true"
+    "--enable-spark-ui"                    = "true"
+    "--spark-event-logs-path"              = "s3://${var.scripts_bucket_name}/spark-event-logs/bronze/"
+    "--enable-job-insights"                = "true"
     "--extra-py-files"                     = "s3://${var.scripts_bucket_name}/glue/lib.zip"
     "--DROPZONE_BUCKET"                    = var.dropzone_bucket_name
     "--BRONZE_BUCKET"                      = var.bronze_bucket_name
@@ -170,6 +181,9 @@ resource "aws_glue_job" "silver_etl" {
     "--enable-auto-scaling"                = "true"
     "--enable-metrics"                     = "true"
     "--enable-continuous-cloudwatch-log"    = "true"
+    "--enable-spark-ui"                    = "true"
+    "--spark-event-logs-path"              = "s3://${var.scripts_bucket_name}/spark-event-logs/silver/"
+    "--enable-job-insights"                = "true"
     "--extra-py-files"                     = "s3://${var.scripts_bucket_name}/glue/lib.zip"
     "--BRONZE_BUCKET"                      = var.bronze_bucket_name
     "--SILVER_BUCKET"                      = var.silver_bucket_name

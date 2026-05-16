@@ -75,6 +75,14 @@ resource "aws_iam_role_policy" "dropzone_seeder" {
         ]
         Resource = ["arn:aws:logs:*:*:*"]
       },
+      {
+        Sid    = "CloudWatchMetrics"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData",
+        ]
+        Resource = ["*"]
+      },
     ]
   })
 }

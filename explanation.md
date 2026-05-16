@@ -1756,6 +1756,113 @@ T4  次日10:00 第二天 Bronze Job 启动该分区
 
 ---
 
+## k) CloudWatch Glue Metrics：`ALL` 与 `JobRunId` 维度的真实语义
+
+### 这是什么
+
+在 CloudWatch 的 `Glue` 命名空间下看 metric（例如 `glue.driver.aggregate.numCompletedTasks`），`JobRunId` 维度会有两类值：
+
+- 具体 run 的 ID：`jr_3db0d6...`
+- 字面量 `ALL`
+
+很容易误以为 `ALL` 是 CloudWatch 后端做的聚合（"所有 job 求和"或"今天的合计"），但都不是。这个理解错了会读错图。
+
+### 真相：`ALL` 是 Spark 端推的**第二份数据流**，不是 CloudWatch 聚合
+
+Spark 的 `GlueCloudWatchReporter` 在推每个 metric 时，**会对同一个数值推两份**，区别只在 `JobRunId` 维度：
+
+```
+某次 run 在 02:08 测到 numCompletedTasks=79，Spark 推：
+
+  PutMetricData {
+    Namespace: Glue,
+    Dimensions: {JobName=silver, JobRunId=jr_3db0d6..., Type=count},
+    Value: 79
+  }
+  PutMetricData {
+    Namespace: Glue,
+    Dimensions: {JobName=silver, JobRunId=ALL, Type=count},     ← 第二份
+    Value: 79                                                    ← 同一个数
+  }
+```
+
+CloudWatch 在后端把这两份当成两条独立的 metric stream，画图时是两条线。**两条线在同一时刻的值一定相同**，因为它们就是同一个数据点的两个副本。
+
+### 关键修正：`ALL` 只展开 `JobRunId`，**不展开 `JobName`**
+
+| 维度 | 在 `ALL` 时的行为 |
+|------|------------------|
+| `JobName` | **钉死**：silver 的 ALL 只含 silver 的数据，不含 bronze |
+| `JobRunId` | **展开**：含这个 job **历次 run** 的所有数据点 |
+| `Type` | **钉死**：count 不会跟 gauge 混 |
+
+所以"`ALL` = 所有 job 求和"是错的。正确说法：**`ALL` 是某个 job 历次 run 的合订本**。
+
+### 为什么需要 `ALL`：跨 run 趋势图，不用预先知道 RunId
+
+```
+仅勾具体 RunId（5 个 run）：
+  jr_A:  ──┐                            ← 每条线只有 run 期间几分钟有值
+  jr_B:    ──┐
+  jr_C:       ──┐
+  jr_D:          ──┐
+  jr_E:             ──┐
+
+勾 ALL（一条线）：
+  ALL:  ──┘──┘──┘──┘──┘                ← 所有 run 的点连成一条连贯曲线
+```
+
+调试 / 看趋势的标准姿势：
+
+| 想看什么 | 选哪条 |
+|----------|--------|
+| Silver 跨多次 run 的趋势 | `JobName=silver, JobRunId=ALL` |
+| Bronze 跨多次 run 的趋势 | `JobName=bronze, JobRunId=ALL` |
+| Bronze vs Silver **对比** | 两条都勾（各自的 ALL）|
+| 单次 run 的细节剖面 | 具体 `jr_xxx` |
+
+### 单次 run 时 `ALL == jr_xxx` 不是 bug，是定义
+
+新部署完只跑过一次的情况下，时间窗里只有一次 run 在发数据：
+
+- `silver/ALL` 在 02:08 收到一份 79
+- `silver/jr_3db0d6` 在 02:08 也收到一份 79（同一时刻 Spark 推的另一份）
+
+两条线完全重合。**只有跑过多次后**，`ALL` 这条线才会沿时间轴展开成连贯曲线（每次 run 贡献几个点），而每个 `jr_xxx` 仍然只在自己 run 那段时间有值——这时 `ALL` 的价值才显出来。
+
+### 关联的统计陷阱：Counter 类 metric **不能用 `Sum`**
+
+Glue metric 的 `Type` 维度只有三种值，对应不同的统计方式：
+
+| `Type` | 是什么 | 推荐 Statistic | 用 Sum 的后果 |
+|--------|--------|---------------|---------------|
+| `count` | Counter，累计值（如 `numCompletedTasks`, `shuffleBytesWritten`） | **Maximum** | Period 内 N 个数据点会被加起来，导致**虚高 N 倍** |
+| `gauge` | 即时值（如 `cpuSystemLoad`, `diskSpaceUsed_MB`） | Average 或 Maximum | 一般没问题，但语义上 Average / Max 更准 |
+| `gluejob` | Glue 服务自己发的 job-level metric（如 `elapsedTime`, `numFailedTasks`） | Average 或 Maximum | 一般没问题 |
+
+为什么 Counter 用 Sum 会虚高：Spark 每 60 秒推一次 counter 的**当前累计值**（不是当 60 秒的增量）。Period=5min 时一个窗口有 5 个数据点 `[60, 70, 80, 85, 87]`，`Sum=382`——完全错的；正确应该是 `Max=87`（窗口末尾的真实累计）。
+
+> 在 1min Period 下不容易看出来（一个窗口通常只采到 1 个点），但切到 5min / 1h Period 时 Sum 会立刻偏离。养成习惯：count 用 Max，gauge/gluejob 看场景。
+
+### Type 维度速查（防止再写错命令）
+
+```bash
+# 不确定某 metric 的 Type 值时，先 list-metrics 一下
+aws cloudwatch list-metrics \
+  --namespace Glue \
+  --metric-name glue.driver.aggregate.shuffleBytesWritten \
+  --dimensions Name=JobName,Value=iodp-dc-silver-etl-dev
+# 输出里 Type 维度的值就告诉你这个 metric 是 count / gauge / gluejob
+```
+
+### 一句话总结
+
+> `ALL` 是 Spark 端推的第二份副本，跨**同一个 job 历次 run** 串联画图用；不展开 `JobName`，不展开 `Type`，也不是 CloudWatch 后端聚合。Counter 类 metric 看 Maximum，不看 Sum。
+
+详细操作步骤（怎么进 Metrics Explorer、怎么 deep-link、怎么对比多次 run）见 [GLUE_DEBUGGING.md §9.7](GLUE_DEBUGGING.md#L97)。
+
+---
+
 ## 总结：这五个机制互相怎么配合
 
 ```
