@@ -6228,4 +6228,501 @@ python scripts/validate_parity.py 2026-05-13
 6. **L3 只在 L1/L2 失败时触发** → 99% 情况下成本极低
 
 
+---
+
+## o) Snowflake SQL 语法点：`=>` 命名参数
+
+> 本节回答：[TEST.md:654](TEST.md#L654) 里 `TABLE_NAME => '...'` 这种 `=>` 是什么语法？
+
+### 这是什么
+
+`=>` 是 SQL 的**命名参数（named argument）**语法，类似 Python 的 keyword argument。
+
+```sql
+-- 命名参数：参数名 => 值
+SELECT *
+FROM TABLE(
+  IODP_DC_DEV.INFORMATION_SCHEMA.COPY_HISTORY(
+    TABLE_NAME  => 'IODP_DC_DEV.SILVER.DC_WIDE',
+    START_TIME  => DATEADD('hour', -12, CURRENT_TIMESTAMP())
+  )
+)
+ORDER BY last_load_time DESC
+LIMIT 50;
+```
+
+类比 Python：
+
+```python
+copy_history(
+    table_name="IODP_DC_DEV.SILVER.DC_WIDE",        # ← TABLE_NAME =>
+    start_time=datetime.now() - timedelta(hours=12) # ← START_TIME =>
+)
+```
+
+### 为什么 Snowflake table function 强制要求
+
+像 `COPY_HISTORY`、`DYNAMIC_TABLE_GRAPH_HISTORY`、`QUERY_HISTORY` 这种 system table function 有**很多可选参数**（`TABLE_NAME` / `START_TIME` / `END_TIME` / `RESULT_LIMIT` / `PIPE_NAME` …）。
+
+如果用位置参数：
+- 容易记错顺序
+- 想跳过中间某个参数没法跳（必须按位置传 NULL）
+- 可读性差，看代码不知道哪个参数是什么
+
+命名参数解决这三个问题：
+- SQL 自解释，看代码知道每个值是什么
+- 可选参数可以省略
+- 跟参数顺序无关
+
+### 本项目里出现的几处
+
+| 位置 | 用法 |
+|------|------|
+| [TEST.md:654](TEST.md#L654) `COPY_HISTORY(TABLE_NAME => ..., START_TIME => ...)` | 查最近 12h 内 Snowpipe COPY 历史 |
+| [TEST.md:750](TEST.md#L750) `DYNAMIC_TABLE_GRAPH_HISTORY(AS_OF => CURRENT_TIMESTAMP())` | 查 Dynamic Table 刷新状态 |
+
+都是 `INFORMATION_SCHEMA` 下的 table function，签名都要求命名参数。
+
+### `=>` ≠ `=`，别混用
+
+```sql
+-- ✅ 传参：用 =>
+COPY_HISTORY(TABLE_NAME => 'IODP_DC_DEV.SILVER.DC_WIDE')
+
+-- ❌ 这里 = 是比较运算符，不是参数传递
+WHERE foo = 'bar'
+
+-- ❌ 写错：参数传递用 = 会 syntax error
+COPY_HISTORY(TABLE_NAME = 'IODP_DC_DEV.SILVER.DC_WIDE')
+```
+
+**记忆口诀**：`=>` 用于"传参"，`=` 用于"比较/赋值"。
+
+### 这不只是 Snowflake 的语法
+
+ANSI SQL 标准的 named argument 就是 `=>`，多个引擎都遵守：
+
+- Snowflake：`COPY_HISTORY(TABLE_NAME => ...)`
+- PostgreSQL 函数调用 / `CALL` 语句：`CALL my_proc(param_name => 'value')`
+- Oracle PL/SQL：`my_procedure(p_name => 'value')`
+
+所以学会这个语法在多个 SQL 引擎之间都通用。
+
+### 什么时候必须用命名参数
+
+Snowflake 文档里 table function 签名标了 `argname =>` 的，**必须**用命名参数，写位置参数会报 `SQL compilation error: invalid argument for function`。安全做法：**所有 INFORMATION_SCHEMA table function 都用命名参数**。
+
+---
+
+## t) SQL JOIN 语法点：`USING (col1, col2, ...)`
+
+> 本节回答：[TEST.md:694](TEST.md#L694) 里 `JOIN src_agg s USING (dt, product_id, app_store)` 是什么意思？
+
+### 这是什么
+
+`USING` 是 `ON` 的简写。当 JOIN 两边的列**名字完全相同**时，可以用 `USING(列名)` 替代 `ON 表.列 = 表.列`。
+
+### 等价写法
+
+```sql
+-- ✅ USING 写法（简洁）
+FROM IODP_DC_DEV.GOLD.DC_DAILY_BY_APP g
+JOIN src_agg s USING (dt, product_id, app_store)
+
+-- ✅ 完全等价的 ON 写法（啰嗦）
+FROM IODP_DC_DEV.GOLD.DC_DAILY_BY_APP g
+JOIN src_agg s
+  ON g.dt         = s.dt
+ AND g.product_id = s.product_id
+ AND g.app_store  = s.app_store
+```
+
+两种写法**执行计划完全一样**，只是语法糖。
+
+### USING 的关键区别：join 列被合并
+
+JOIN 后的结果列数不一样：
+
+```sql
+-- ON：dt 在结果里出现两次（g.dt 和 s.dt 都保留）
+SELECT * FROM g JOIN s ON g.dt = s.dt;
+-- 结果列：g.dt, s.dt, g.product_id, s.product_id, ...
+
+-- USING：dt 合并成一列（inner join 时两边一定相等，取一份就够）
+SELECT * FROM g JOIN s USING (dt);
+-- 结果列：dt（只一列）, g.product_id, s.product_id, ...
+```
+
+**结果**：用 `USING` 后，`SELECT *` 不会出现重复的 join 列；裸列名 `dt` 不再 ambiguous。
+
+### 在本项目里的好处
+
+[TEST.md:694](TEST.md#L694)：
+
+```sql
+JOIN src_agg s USING (dt, product_id, app_store)
+WHERE g.downloads_total <> s.s_total
+```
+
+- 5 列复合 PK 用 ON 要写 `ON g.a=s.a AND g.b=s.b AND g.c=s.c AND g.d=s.d AND g.e=s.e`，啰嗦且容易漏
+- `USING (a,b,c,d,e)` 一行解决
+- 后面 SELECT / WHERE 引用 join 列时可以写裸列名（不用加表别名）
+
+### 限制 / 注意点
+
+| 场景 | USING 能用吗 |
+|------|------------|
+| 两边列名相同 | ✅ |
+| 两边列名不同（如 `g.product_id` vs `s.pid`） | ❌ 必须用 ON |
+| 列类型不同需要 CAST | ❌ 必须用 ON |
+| 复杂条件（如 `g.dt > s.dt`、范围 JOIN） | ❌ 必须用 ON |
+| OUTER JOIN（LEFT / RIGHT / FULL） | ✅ 能用，行为略不同（合并列在缺失侧取另一边的值） |
+
+### 本项目里用 `USING` 的几处
+
+| 位置 | 用法 |
+|------|------|
+| [TEST.md:694](TEST.md#L694) `USING (dt, product_id, app_store)` | Gold 按 app 维度对账 |
+| [TEST.md:709](TEST.md#L709) `USING (dt, country, app_store)` | Gold 按 country 维度对账 |
+| [TEST.md:918](TEST.md#L918) `USING (dt, product_id, app_store, country, device)` | Silver vs Bronze pivot 五列复合 PK |
+
+5 列复合 join key 用 `USING` 比 `ON ... AND ... AND ... AND ... AND ...` 节省一大段代码、可读性更高。
+
+### 一句话总结
+
+**`USING (col1, col2, ...)` = `ON 左.col1=右.col1 AND 左.col2=右.col2 AND ...` + 合并 join 列**。两边列名相同时优先用 `USING`，列名不同时只能用 `ON`。
+
+---
+
+## u) Dynamic Table 排查：`GRAPH_HISTORY` vs `REFRESH_HISTORY` 用错会编译失败
+
+> 本节回答：[TEST.md §8.4](TEST.md#L736) 之前那段 SQL 为什么报 `invalid identifier 'STATE'`？两个长得像的 table function 到底怎么选？
+
+### 现象
+
+之前 TEST.md §8.4 写的 SQL（已修）：
+
+```sql
+SELECT
+  name,
+  state,                      -- ← 报错位置
+  target_lag,
+  scheduling_state,
+  last_completed_at,
+  ...
+FROM TABLE(IODP_DC_DEV.INFORMATION_SCHEMA.DYNAMIC_TABLE_GRAPH_HISTORY(
+  AS_OF => CURRENT_TIMESTAMP()
+));
+```
+
+跑出来：
+
+```
+SQL compilation error: error line 277 at position 2 invalid identifier 'STATE'
+```
+
+错误信息**不是**说 `state` 是关键字，而是 **`DYNAMIC_TABLE_GRAPH_HISTORY` 根本没有这一列**。
+
+> 顺带澄清：Snowflake 错误信息里
+> - `invalid identifier 'X'` = 找不到列/对象 X
+> - `syntax error` / `unexpected token` = 才是关键字冲突 / 语法问题
+>
+> 看错误类型能省一半排查时间。
+
+### Snowflake 有两个长得像的 Dynamic Table table function
+
+| Function | 用途 | 关键列 | 是否能查 "刷新成功了吗" |
+|----------|------|-------|------------------|
+| **`DYNAMIC_TABLE_GRAPH_HISTORY`** | 看 DAG 拓扑、依赖关系、target_lag 配置 | name, qualified_name, **inputs**, target_lag_sec, target_lag_type, scheduling_state (OBJECT) | ❌ 没有 state / refresh_end_time |
+| **`DYNAMIC_TABLE_REFRESH_HISTORY`** | 看**每次刷新的执行历史**（成功/失败/耗时）| name, **state**, refresh_action, refresh_trigger, **refresh_start_time**, **refresh_end_time**, completion_target | ✅ 这才是 "is_stale" 校验要的 |
+
+**记忆口诀**：
+- `GRAPH` = 图（拓扑结构、谁依赖谁），**静态**
+- `REFRESH` = 刷新（每一次跑的 log），**动态**
+
+要做 "数据是否新鲜、上次刷新成功没" 这种运维校验 → 永远是 `REFRESH_HISTORY`。
+
+### 正确的 SQL
+
+修后版本（见 [TEST.md §8.4](TEST.md#L738)）：
+
+```sql
+WITH latest AS (
+  SELECT
+    name,
+    state,
+    refresh_action,
+    refresh_start_time,
+    refresh_end_time,
+    ROW_NUMBER() OVER (PARTITION BY name ORDER BY refresh_end_time DESC NULLS LAST) AS rn
+  FROM TABLE(
+    IODP_DC_DEV.INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY()
+  )
+  WHERE schema_name = 'GOLD'
+)
+SELECT
+  name,
+  state,                       -- 'SUCCEEDED' / 'FAILED' / 'CANCELLED' / 'UPSTREAM_FAILED'
+  refresh_start_time,
+  refresh_end_time,
+  refresh_end_time IS NULL
+    OR TIMESTAMPDIFF('minute', refresh_end_time, CURRENT_TIMESTAMP()) > 60
+    AS is_stale
+FROM latest
+WHERE rn = 1
+ORDER BY is_stale DESC, name;
+```
+
+**关键改动**：
+
+1. `DYNAMIC_TABLE_GRAPH_HISTORY` → `DYNAMIC_TABLE_REFRESH_HISTORY`
+2. 去掉 `AS_OF =>` 参数（这是 GRAPH_HISTORY 的参数，REFRESH_HISTORY 不接受 AS_OF）
+3. 去掉 `target_lag` / `scheduling_state` / `last_completed_at` 这些 REFRESH_HISTORY 里没有的列
+4. 加 `ROW_NUMBER() ... rn = 1` 取每张表最新一次刷新（否则会返回多行历史记录）
+
+### `state` 的取值
+
+REFRESH_HISTORY 的 `state` 列可能值：
+
+| state | 含义 | 怎么处理 |
+|-------|------|---------|
+| `SUCCEEDED` | 刷新成功 | 正常 |
+| `FAILED` | 刷新失败（业务逻辑出错） | 看 query history 定位 |
+| `CANCELLED` | 被手工取消 | 通常是人为操作 |
+| `UPSTREAM_FAILED` | 上游 Dynamic Table 失败导致这个也没刷 | 先修上游 |
+| `SCHEDULED` / `EXECUTING` | 正在跑 | 等 |
+
+监控告警最简单的规则：`state NOT IN ('SUCCEEDED', 'SCHEDULED', 'EXECUTING')` 就告警。
+
+### 教训：写参考文档里的 SQL 要 dry-run
+
+这个 bug 在 TEST.md 里趴了一阵子才被发现 —— 因为 §8.4 是出问题时才会跑的运维 SQL，不是每天都跑。**任何参考文档里的 SQL 都应该至少在一个环境里跑过一次**，否则就是"自信但未验证"的代码债。本项目里 [TEST.md](TEST.md) 其他章节的 SQL 都跑过，只有 §8.4 这段当时没真触发过 Dynamic Table 停摆所以没跑 —— 是个 documentation rot 的小例子。
+
+### 相关 system function 速查表（Dynamic Table / Snowpipe 运维）
+
+| Function | 用途 |
+|----------|------|
+| `DYNAMIC_TABLE_REFRESH_HISTORY()` | 每次刷新的 state / 耗时 |
+| `DYNAMIC_TABLE_GRAPH_HISTORY(AS_OF => ...)` | 表之间的依赖图谱 |
+| `COPY_HISTORY(TABLE_NAME => ..., START_TIME => ...)` | Snowpipe / COPY 加载历史 |
+| `PIPE_USAGE_HISTORY(DATE_RANGE_START => ...)` | Snowpipe credit 消耗历史 |
+| `SYSTEM$PIPE_STATUS('<pipe>')` | 实时看 Pipe pendingFileCount |
+
+全部都在 `INFORMATION_SCHEMA` schema 下，全部需要**命名参数**（见 §o），且**列名各不相同**——写 SQL 前先 `SHOW COLUMNS` 或翻 Snowflake 文档，别凭记忆瞎写。
+
+---
+
+## v) "周对周" 的三种含义：DoD-7 vs 真 WoW vs 滚动 7 天均值
+
+> 本节回答：[TEST.md §9.4](TEST.md#L810) 之前那段 SQL 为什么不是真正的 "周对周"？
+
+### 现象：原写法对得不是 7 天，是 1 天
+
+之前 [TEST.md §9.4](TEST.md#L810) 的 SQL（已修）：
+
+```sql
+WITH base AS (
+  SELECT dt, product_id, app_store, SUM(downloads_total) AS total
+  FROM IODP_DC_DEV.SILVER.DC_WIDE
+  WHERE dt IN ('2026-05-13', '2026-05-06')
+  GROUP BY 1, 2, 3
+)
+SELECT ... c.total AS this_dt, p.total AS prior_dt,
+       ROUND(100.0 * (c.total - p.total) / NULLIF(p.total, 0), 2) AS wow_pct
+FROM base c LEFT JOIN base p
+  ON ... AND p.dt = DATEADD('day', -7, c.dt)
+WHERE c.dt = '2026-05-13';
+```
+
+JOIN 条件 `p.dt = DATEADD('day', -7, c.dt)` + WHERE `c.dt = '2026-05-13'` → 两边各取**单天**做差。这其实是 "**同 weekday 的 D-7 对比**"，不是真正的周对周。列名却叫 `wow_pct` → 误导。
+
+### 三种 "周对周" 的真实含义
+
+| 方案 | 比什么 | SQL 关键 | 适合 |
+|------|-------|---------|------|
+| **A. DoD-7（原写法的真实身份）** | 2026-05-13 这天 vs 2026-05-06 这天 | `WHERE dt IN (D, D-7)` + JOIN on `D-7` | 排查 / 快速感知，消除 weekday seasonality 但仍是 1 天数据 |
+| **B. 真 WoW（已落地）** | `[D-6, D]` 7 天累计 vs `[D-13, D-7]` 7 天累计 | `SUM(CASE WHEN dt BETWEEN ... END)` 一个 CTE 两个窗口 | 业务周报、对老板讲数 |
+| **C. 7 天滚动均值** | `D` 处的 7 天滚动均值 vs `D-7` 处的 7 天滚动均值 | `AVG(...) OVER (... ROWS 6 PRECEDING)` | BI 趋势图、Grafana 上的平滑曲线 |
+
+### 方案 B 完整写法（[TEST.md §9.4](TEST.md#L810) 已采用）
+
+```sql
+WITH weekly AS (
+  SELECT
+    product_id, app_store,
+    SUM(CASE WHEN dt BETWEEN DATEADD('day', -6,  DATE '2026-05-13')
+                         AND DATE '2026-05-13'
+             THEN downloads_total END) AS this_week,
+    SUM(CASE WHEN dt BETWEEN DATEADD('day', -13, DATE '2026-05-13')
+                         AND DATEADD('day', -7,  DATE '2026-05-13')
+             THEN downloads_total END) AS prior_week
+  FROM IODP_DC_DEV.SILVER.DC_WIDE
+  WHERE dt BETWEEN DATEADD('day', -13, DATE '2026-05-13')
+              AND DATE '2026-05-13'
+  GROUP BY product_id, app_store
+)
+SELECT
+  product_id, app_store,
+  this_week, prior_week,
+  ROUND(100.0 * (this_week - prior_week) / NULLIF(prior_week, 0), 2) AS wow_pct
+FROM weekly
+WHERE this_week IS NOT NULL
+ORDER BY wow_pct DESC NULLS LAST
+LIMIT 20;
+```
+
+**关键设计选择**：
+
+1. **一个 CTE 两个窗口**：用 `SUM(CASE WHEN dt BETWEEN ... END)` 在同一次扫描里同时算出 this_week / prior_week，比 self-join 高效（只扫一次分区）
+2. **WHERE 加全窗口过滤**：`WHERE dt BETWEEN D-13 AND D` 让 Snowflake 做 partition pruning，否则 CASE WHEN 里的范围 filter 不会下推
+3. **`/NULLIF(prior_week, 0)`**：前 7 天 0 下载就返回 NULL，避免除零
+4. **`WHERE this_week IS NOT NULL`**：过滤掉只在前 7 天有数据、本周没数据的"消失产品"，避免 `wow_pct = -100%` 充斥榜单顶部
+
+### 方案 A（DoD-7）什么时候还要用
+
+虽然 §9.4 换成方案 B 了，但 DoD-7 仍有适用场景：
+
+- 排查："今天的数比上周这天少 30%，先看看是 weekday 问题还是真异常"
+- 单天看板：dashboard 只展示一个数字，无法塞 7 天累计
+- 实时性优先：今天数据还在涨（preview），算累计还要等到 D+1 finalized
+
+### 方案 C（滚动 7 天均值）什么时候用
+
+```sql
+AVG(daily_total) OVER (
+  PARTITION BY product_id, app_store
+  ORDER BY dt
+  ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+)
+```
+
+- BI 趋势图：方案 A 在图上是锯齿（weekday 波动），方案 C 是平滑曲线
+- 看"真实趋势"：偶发一天 spike 不影响整周均值
+- 缺点：对短期变化反应慢（spike 当天均值只升 1/7）
+
+### 为什么这个 bug 容易出现
+
+"周对周"在中文/英文里都是模糊术语：
+- 业务说 "WoW"，可能指方案 A、B、C 任一种
+- 程序员写 SQL 时不澄清，习惯性 `DATEADD('day', -7, ...)` 跟 7 天前**那一天**比
+- 字段名沿用 `wow_pct` 但实际是 DoD-7，下游消费者按 "周对周" 来解读 → 决策偏差
+
+**防御**：
+- 字段命名**反映 SQL 实际行为**，不反映业务术语 → `dow7_pct` vs `wow7d_pct` vs `wow_rolling7d_pct`
+- 文档/注释里**给出窗口的精确定义**（`[dt-6, dt]` vs `[dt-13, dt-7]`）
+- 跟 BI/PM 对齐：他们脑子里的 "WoW" 是哪种
+
+### 一句话总结
+
+**"周对周" 不是单一概念**：方案 A 比单天（DoD-7）、方案 B 比 7 天累计（真 WoW）、方案 C 比 7 天滚动均值。三种都合理，但字段名必须和算法一致，否则下游会按错误的语义做决策。
+
+---
+
+## COPY_HISTORY 行数 ≠ 表里实际行数：是谁在去重？
+
+### 现象
+
+跑两条 SQL 对比：
+
+```sql
+-- A. Snowpipe COPY_HISTORY（最近 144h）
+SELECT file_name, status, row_count, last_load_time
+FROM TABLE(
+  IODP_DC_DEV.INFORMATION_SCHEMA.COPY_HISTORY(
+    TABLE_NAME => 'IODP_DC_DEV.SILVER.DC_WIDE',
+    START_TIME => DATEADD('hour', -144, CURRENT_TIMESTAMP())
+  )
+);
+
+-- B. 表里 GROUP BY dt 的实际行数
+SELECT dt, COUNT(*) AS rows_, SUM(downloads_total) AS total
+FROM IODP_DC_DEV.SILVER.DC_WIDE
+GROUP BY dt ORDER BY dt DESC;
+```
+
+| dt | A: COPY_HISTORY loaded | B: 表里 count | 差值 |
+|----|----|----|----|
+| 2026-05-11 | 2000 | 1000 | 50% |
+| 2026-05-12 | 4000 | 2000 | 50% |
+| 2026-05-13 | 1000 | 1000 | 0% |
+
+A 比 B 多出整整一倍。**不是 Snowflake 自带的去重**，Snowflake 没有行级自动去重，Snowpipe 是 append-only 语义。
+
+### 真正的去重者：自定义 Task
+
+去重是这个项目自己写的 Snowflake Task 做的 —— [snowflake_sql/06_dedup_task.sql](snowflake_sql/06_dedup_task.sql)：
+
+```sql
+CREATE OR REPLACE TASK IODP_DC_DEDUP_${ENV}
+  WAREHOUSE = COMPUTE_WH_DC_${ENV}
+  SCHEDULE  = 'USING CRON 0 6 * * * UTC'     -- 每日 UTC 06:00
+AS
+DELETE FROM SILVER.DC_WIDE
+WHERE (_loaded_at, dt, product_id, app_store, country, device) IN (
+  SELECT _loaded_at, dt, product_id, app_store, country, device
+  FROM (
+    SELECT _loaded_at, dt, product_id, app_store, country, device,
+      ROW_NUMBER() OVER (
+        PARTITION BY dt, product_id, app_store, country, device
+        ORDER BY _loaded_at DESC
+      ) AS rn
+    FROM SILVER.DC_WIDE
+    WHERE dt >= DATEADD('day', -10, CURRENT_DATE())
+  )
+  WHERE rn > 1
+);
+```
+
+关键点：
+
+1. **每日 UTC 06:00** 跑一次
+2. 处理最近 **10 天**（restate 窗口）
+3. 按 `(dt, product_id, app_store, country, device)` 分组
+4. 保留每组 `_loaded_at` 最新的一行，其余 `DELETE`
+
+### 为什么会有重复行？
+
+[06_dedup_task.sql:4-7](snowflake_sql/06_dedup_task.sql#L4-L7) 注释说得很明白：
+
+> Snowpipe 是 append-only 语义。当 Silver Glue Job 覆盖写某个 dt 分区后，Snowpipe 会把新文件当作新数据再 COPY 一次，导致同一 `(dt, product_id, ...)` 出现多行。
+
+流程：
+
+```
+Glue Job 第一次写  S3://silver/dt=2026-05-11/file_v1.parquet
+                                ↓ Snowpipe COPY
+                              DC_WIDE: 1000 行
+Restate 重跑       S3://silver/dt=2026-05-11/file_v2.parquet（覆盖）
+                                ↓ Snowpipe COPY（新文件 → 再 COPY 一次）
+                              DC_WIDE: 2000 行（同一主键各 2 份）
+                                ↓ 06:00 UTC 跑 IODP_DC_DEDUP
+                              DC_WIDE: 1000 行（rn=1 保留，rn=2 删除）
+```
+
+对上现象：
+
+- **05-11、05-12**：当天数据被加载过两次（原始 + restate），dedup task 已经跑过，所以表里只剩一半
+- **05-13**：只加载过一次（或当天 06:00 dedup 还没跑），COPY_HISTORY 和表里行数一致
+
+### Snowflake **确实有**的去重 —— 但不是这个
+
+别混淆两件事：
+
+| 类型 | Snowflake 是否提供 | 适用范围 |
+|----|----|----|
+| **文件级**去重 | ✅ Snowpipe 内置 | 14 天内同名文件不会被重复 COPY |
+| **行级**去重 | ❌ 没有 | 必须自己写 `MERGE` / `DELETE` / Task |
+
+Snowpipe 的文件级去重保证"同一个文件名"在 14 天内只被加载一次，但 Glue Job 覆盖写时生成的是**新文件名**（`file_v2.parquet`），所以 Snowpipe 把它当新文件再 COPY 一次 —— 文件级去重在这里救不了你，必须靠行级 dedup task。
+
+### 设计取舍：为什么不在 Snowpipe 之前去重？
+
+理论上也可以让 Glue Job 写之前先比对、只写增量。但当前架构选择"先加载，再去重"，原因：
+
+- **Snowpipe 必须 append-only**：要换成 MERGE 就得放弃 Snowpipe，改成 Task + COPY，损失实时性
+- **Restate 友好**：Glue Job 直接覆盖写分区是最简单的回填语义，不用维护"哪些行已存在"的状态
+- **Dedup window = 10 天**：限制扫描成本，restate 超过 10 天的情况极少
+
+代价是：表里短时会有重复行（最长持续到下一个 06:00 UTC），所以下游 BI 视图 [snowflake_sql/07_bi_view.sql](snowflake_sql/07_bi_view.sql) 和 Gold Dynamic Tables [snowflake_sql/05_gold_dynamic_tables.sql](snowflake_sql/05_gold_dynamic_tables.sql) 要么自己 dedup，要么忍受短时偏差。
+
 

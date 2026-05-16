@@ -741,14 +741,13 @@ SHOW DYNAMIC TABLES IN SCHEMA IODP_DC_DEV.GOLD;
 SELECT
   name,
   state,
-  target_lag,
-  scheduling_state,
-  last_completed_at,
-  last_completed_at IS NULL OR
-    TIMESTAMPDIFF('minute', last_completed_at, CURRENT_TIMESTAMP()) > 60 AS is_stale
-FROM TABLE(IODP_DC_DEV.INFORMATION_SCHEMA.DYNAMIC_TABLE_GRAPH_HISTORY(
-  AS_OF => CURRENT_TIMESTAMP()
+  refresh_end_time,
+  refresh_end_time IS NULL OR
+    TIMESTAMPDIFF('minute', refresh_end_time, CURRENT_TIMESTAMP()) > 60 AS is_stale
+FROM TABLE(IODP_DC_DEV.INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+  NAME_PREFIX => 'IODP_DC_DEV.GOLD'
 ));
+
 
 -- 强制刷新（如果数据看着还没进 Gold，又等不及 TARGET_LAG）:
 ALTER DYNAMIC TABLE IODP_DC_DEV.GOLD.DC_DAILY_BY_APP        REFRESH;
@@ -808,29 +807,38 @@ GROUP BY 1, 2
 ORDER BY 1 DESC, 2;
 ```
 
-### 9.4 同比 / 环比（dt vs dt-7）
+### 9.4 周对周（WoW）：本周 7 天累计 vs 前 7 天累计
+
+> 真正的 "周对周" 应该比 **7 天累计 vs 7 天累计**，而不是单天 vs 单天（后者只是 "同一星期几相隔 7 天"，受 weekday seasonality 影响小但仍是 1 天数据，不是 1 周）。
+> 设 `:dt = '2026-05-13'`，本周窗口 = `[dt-6, dt]`，前一周窗口 = `[dt-13, dt-7]`。
 
 ```sql
-WITH base AS (
-  SELECT dt, product_id, app_store, SUM(downloads_total) AS total
+WITH weekly AS (
+  SELECT
+    product_id, app_store,
+    SUM(CASE WHEN dt BETWEEN DATEADD('day', -6,  DATE '2026-05-13')
+                         AND DATE '2026-05-13'
+             THEN downloads_total END) AS this_week,
+    SUM(CASE WHEN dt BETWEEN DATEADD('day', -13, DATE '2026-05-13')
+                         AND DATEADD('day', -7,  DATE '2026-05-13')
+             THEN downloads_total END) AS prior_week
   FROM IODP_DC_DEV.SILVER.DC_WIDE
-  WHERE dt IN ('2026-05-13', '2026-05-06')
-  GROUP BY 1, 2, 3
+  WHERE dt BETWEEN DATEADD('day', -13, DATE '2026-05-13')
+              AND DATE '2026-05-13'
+  GROUP BY product_id, app_store
 )
 SELECT
-  c.product_id, c.app_store,
-  c.total                                        AS this_dt,
-  p.total                                        AS prior_dt,
-  ROUND(100.0 * (c.total - p.total) / NULLIF(p.total, 0), 2) AS wow_pct
-FROM base c
-LEFT JOIN base p
-  ON p.product_id = c.product_id
- AND p.app_store  = c.app_store
- AND p.dt = DATEADD('day', -7, c.dt)
-WHERE c.dt = '2026-05-13'
+  product_id, app_store,
+  this_week,
+  prior_week,
+  ROUND(100.0 * (this_week - prior_week) / NULLIF(prior_week, 0), 2) AS wow_pct
+FROM weekly
+WHERE this_week IS NOT NULL
 ORDER BY wow_pct DESC NULLS LAST
 LIMIT 20;
 ```
+
+> 想要"同一 weekday 单天对比"（DoD-7）或"7 天滚动均值"的写法，见 [explanation.md §v](explanation.md)。
 
 ### 9.5 preview vs finalized 数据分布（提醒下游谨慎用）
 
