@@ -298,20 +298,67 @@ status: ## Show deployment status
 # ════════════════════════════════════════════════════════════════
 #  Destroy
 # ════════════════════════════════════════════════════════════════
+# Three targets, separated so each side can run independently:
+#   make destroy            — AWS only (empties S3 + terraform destroy)
+#   make destroy-snowflake  — Snowflake only (DROP DATABASE CASCADE)
+#   make destroy-all        — chains both
+# Pre-destroy S3 emptying is mandatory: bronze/silver have versioning and no
+# force_destroy=true, so `terraform destroy` would fail with BucketNotEmpty.
 
 .PHONY: destroy
-destroy: ## Destroy all infrastructure (with confirmation)
-	@echo "WARNING: This will destroy ALL resources in $(ENV)."
-	@echo "Snowflake database must be dropped manually after Terraform destroy."
-	@read -p "Type 'yes' to confirm: " confirm && [ "$$confirm" = "yes" ] || exit 1
-	$(MAKE) do-destroy
-
-.PHONY: do-destroy
-do-destroy:
-	cd $(TF_DIR) && terraform destroy $(TF_VARS)
+destroy: ## Destroy all AWS resources (empties S3 first, then terraform destroy). Snowflake: see destroy-snowflake.
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo " DESTROY AWS resources for ENV=$(ENV)  ACCOUNT=$(AWS_ACCOUNT_ID)  REGION=$(AWS_REGION)"
+	@echo "  This will:"
+	@echo "    • Empty 3 S3 buckets (bronze / silver / scripts) including ALL versions"
+	@echo "    • terraform destroy (Glue / DynamoDB / IAM / SNS / SQS / Observability ...)"
+	@echo "  NOT touched (separate / manual):"
+	@echo "    • Snowflake database IODP_DC_$$(echo $(ENV) | tr '[:lower:]' '[:upper:]')"
+	@echo "      → run: make destroy-snowflake ENV=$(ENV)"
+	@echo "    • TF state bucket iodp-terraform-state-$(ENV) (kept for redeploy)"
+	@echo "      → delete manually if you don't plan to redeploy"
+	@echo "═══════════════════════════════════════════════════════════"
+	@read -p "Type 'destroy-$(ENV)' to confirm: " confirm && [ "$$confirm" = "destroy-$(ENV)" ] || { echo "Aborted."; exit 1; }
+	@$(MAKE) ENV=$(ENV) empty-s3-buckets
+	cd $(TF_DIR) && terraform destroy $(TF_VARS) -auto-approve
 	@echo ""
-	@echo "NOTE: Manually drop Snowflake database:"
-	@echo "  DROP DATABASE IODP_DC_$$(echo $(ENV) | tr '[:lower:]' '[:upper:]');"
+	@echo "AWS destroy complete. Next steps to fully zero out cost:"
+	@echo "  • make destroy-snowflake ENV=$(ENV)   # drop Snowflake DB"
+	@echo "  • (optional) aws s3 rb s3://iodp-terraform-state-$(ENV) --force"
+
+.PHONY: empty-s3-buckets
+empty-s3-buckets: ## Empty bronze/silver/scripts buckets incl. all versions (pre-destroy helper)
+	@for bucket in iodp-dc-bronze-$(ENV)-$(AWS_ACCOUNT_ID) iodp-dc-silver-$(ENV)-$(AWS_ACCOUNT_ID) iodp-dc-scripts-$(ENV)-$(AWS_ACCOUNT_ID); do \
+		if aws s3api head-bucket --bucket "$$bucket" 2>/dev/null; then \
+			echo "→ Emptying $$bucket (all versions + delete markers)..."; \
+			python3 scripts/empty_s3_bucket.py "$$bucket"; \
+		else \
+			echo "  bucket $$bucket not found, skipping"; \
+		fi; \
+	done
+
+.PHONY: destroy-snowflake
+destroy-snowflake: check-snowflake ## Drop Snowflake database for ENV (separate from AWS destroy)
+	@DB_NAME="IODP_DC_$$(echo $(ENV) | tr '[:lower:]' '[:upper:]')"; \
+	echo "═══════════════════════════════════════════════════════════"; \
+	echo " DROP Snowflake DATABASE $$DB_NAME CASCADE"; \
+	echo "   All schemas / tables / pipes / stages / tasks / dynamic tables"; \
+	echo "   inside the database will be dropped."; \
+	echo "═══════════════════════════════════════════════════════════"; \
+	read -p "Type 'drop-$(ENV)' to confirm: " confirm && [ "$$confirm" = "drop-$(ENV)" ] || { echo "Aborted."; exit 1; }; \
+	echo "DROP DATABASE IF EXISTS $$DB_NAME CASCADE;" | snowsql \
+		-a "$$SNOWFLAKE_ACCOUNT" \
+		-u "$$SNOWFLAKE_USER" \
+		-r "$${SNOWFLAKE_ROLE:-ACCOUNTADMIN}" \
+		-w "$${SNOWFLAKE_WAREHOUSE:-COMPUTE_WH}"; \
+	echo "Snowflake database $$DB_NAME dropped."
+
+.PHONY: destroy-all
+destroy-all: ## Destroy AWS + Snowflake (chains destroy then destroy-snowflake)
+	@$(MAKE) ENV=$(ENV) destroy
+	@$(MAKE) ENV=$(ENV) destroy-snowflake
+	@echo ""
+	@echo "All resources for ENV=$(ENV) destroyed."
 
 # ════════════════════════════════════════════════════════════════
 #  Misc

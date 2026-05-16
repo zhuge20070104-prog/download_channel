@@ -1863,6 +1863,175 @@ aws cloudwatch list-metrics \
 
 ---
 
+## l) Spark Join 类型：Sort-Merge vs Broadcast
+
+### 这是什么
+
+Spark 在 join 两张表时不止一种执行方式，**选错会让 join 慢 10x ~ 100x**。最常见的两种：
+
+- **Sort-Merge Join (SMJ)**：两张表都大，各自排序后 shuffle 到同一 partition，再按 key 顺序合并
+- **Broadcast Hash Join (BHJ)**：一张表小到能塞进每个 executor 内存，就把它**广播**一份给所有 executor；大表不动，每个 executor 在本地查 hash 表
+
+调 Spark 性能时一半的功夫是在 Spark UI 的 **SQL / DataFrame tab** 看每个 join 节点选了哪种，发现该 BHJ 的地方却用了 SMJ → 强制 broadcast 一下，瞬间快好几倍。
+
+### 生活类比
+
+你和同事都拿了一份 Excel，要按 `student_id` 找出共同行。
+
+**场景 1：两张表都很大（5 万行 vs 5 万行）—— Sort-Merge**
+
+```
+1. 你俩各自先按 student_id 排序自己手里的表（成本 1）
+2. 把表按 ID 段切成 10 块，每人拿对应块（shuffle，成本 2）
+3. 逐行从上往下扫，遇到相同 ID 就配对（成本 3）
+```
+
+排序 + 重新分发是必须的——任何一边没排序，就得来回翻表（O(N²)）。
+
+**场景 2：一张大表 + 一张小表（5 万行 vs 100 行）—— Broadcast**
+
+```
+1. 你把小表复印 10 份（broadcast，成本 1）
+2. 把大表平均切 10 份，每人一份（这一步本来就是 Spark 默认分区，零额外成本）
+3. 每人在自己手里的大表里查小表的 100 个 ID（hash 查找，成本 2）
+```
+
+不需要排序，不需要分发大表，只复印小表那一次的成本。
+
+**关键直觉**：大表移动一次的代价远大于小表移动一次。能不动大表就别动。
+
+### 详细对比
+
+| 维度 | Sort-Merge Join | Broadcast Hash Join |
+|------|----------------|--------------------|
+| **适用场景** | 两张表都大 | 一张小（默认 ≤ 10MB） |
+| **Shuffle** | 两边都要 shuffle 一次 | 大表 0 shuffle，小表 broadcast 一次 |
+| **排序成本** | 两边都要排序 | 都不用排 |
+| **Spark UI 显示** | `SortMergeJoin` | `BroadcastHashJoin` |
+| **触发条件** | 默认 fallback | 小表 ≤ `spark.sql.autoBroadcastJoinThreshold`（默认 10MB），或显式 `F.broadcast(df)` |
+| **典型失败模式** | 慢，但很少 OOM | 小表估错大小 → driver OOM、executor OOM |
+| **典型耗时** | 10s ~ 10min | 1s ~ 30s |
+| **网络 IO** | 大表 + 小表全过网 | 只小表过网 N 次（N = executor 数） |
+
+### 物理过程对比图
+
+```
+─── Sort-Merge Join（两张表都 100GB） ────────────────────────────
+                                       
+   Big_A (100GB)                       Big_B (100GB)
+   ┌────┐┌────┐┌────┐┌────┐            ┌────┐┌────┐┌────┐┌────┐
+   │part││part││part││part│            │part││part││part││part│
+   └─┬──┘└─┬──┘└─┬──┘└─┬──┘            └─┬──┘└─┬──┘└─┬──┘└─┬──┘
+     │     │     │     │                 │     │     │     │
+     └──┬──┴──┬──┴──┬──┘   shuffle      └──┬──┴──┬──┴──┬──┘
+        │     │     │      (两边都要)       │     │     │
+     ┌──▼──┐ ┌▼───┐ ┌▼───┐               ┌──▼──┐ ┌▼───┐ ┌▼───┐
+     │sort │ │sort│ │sort│               │sort │ │sort│ │sort│
+     └──┬──┘ └─┬──┘ └─┬──┘               └──┬──┘ └─┬──┘ └─┬──┘
+        └──────┼──────┴──────► merge ◄──────┴──────┴──────┘
+   200GB 数据全部过网 + 全部排序                              
+
+─── Broadcast Hash Join（大表 100GB + 小表 5MB） ──────────────
+                                                            
+   Big (100GB)                           Small (5MB)
+   ┌────┐┌────┐┌────┐┌────┐                  ┌──┐
+   │part││part││part││part│                  │tb│
+   └─┬──┘└─┬──┘└─┬──┘└─┬──┘                  └─┬┘
+     │     │     │     │       broadcast       │
+     │     │     │     │   ┌───────┬───┬───────┤
+     │     │     │     │   ▼       ▼   ▼       ▼
+   ┌─▼─┐ ┌─▼─┐ ┌─▼─┐ ┌─▼─┐                    
+   │hash││hash││hash││hash│  每个 executor 拿一份小表副本    
+   │join││join││join││join│  在本地查找                   
+   └────┘└────┘└────┘└────┘                              
+   大表 0 移动，小表 5MB × 4 = 20MB 过网                    
+```
+
+注意 IO 量差异：SMJ 要 200GB 全网，BHJ 只要 20MB 全网。**差 10000 倍**。这就是为什么 Spark 默认就要试图 broadcast——能 broadcast 就别 SMJ。
+
+### 本项目里什么时候用哪种
+
+Silver 主流程（pivot narrow → wide）**没有显式 join**，是 groupBy + pivot，触发的是 `HashAggregate` 不是 join。但下列场景一定会触发 join：
+
+| 场景 | 应该 | 理由 |
+|------|------|------|
+| Silver join lookup 表（如 country code → country name 的 ISO 映射）| Broadcast | lookup 表通常 < 100KB，必须 broadcast |
+| Bronze 跨日期 join（如 join 今天和昨天的数据做 restate 检测）| SMJ | 两边都是几 GB 同量级 |
+| DLQ replay 时 join checkpoint 表（DynamoDB 导出的）| Broadcast | checkpoint 表整张几 KB |
+| Silver 跟一张几十 MB 的"产品维表" join | Broadcast，但要调阈值 | 默认 10MB 阈值不够，要手动 `F.broadcast()` 或调 `autoBroadcastJoinThreshold` |
+
+打开 Silver run 的 Spark History Server → **SQL / DataFrame tab** → 点每个 SQL 节点能看到物理计划，里面 join 节点会标 `BroadcastHashJoin` 或 `SortMergeJoin`，**一眼就知道选对没**。
+
+### 强制 broadcast 的两种写法
+
+显式标记（最推荐——意图清楚，不依赖 Spark 估算）：
+
+```python
+from pyspark.sql import functions as F
+
+# 100 行的国家映射表
+country_lookup = spark.read.parquet("s3://.../country_map/")
+
+joined = silver_df.join(F.broadcast(country_lookup), "country_code", "left")
+```
+
+调全局阈值（一次性提高所有 join 的 broadcast 上限）：
+
+```python
+# 默认 10MB → 100MB
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 100 * 1024 * 1024)
+```
+
+禁用 broadcast（极少用，比如 driver 内存紧张时）：
+
+```python
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+```
+
+### 三个常见坑
+
+**坑 1：broadcast 表太大，driver OOM**
+
+```
+原因：F.broadcast(big_df) 强制 broadcast 但 big_df 实际 500MB
+现象：driver 在 collect 阶段 OOM 死，job FAILED，Spark UI Executors tab 看 driver GC 时间爆炸
+修法：去掉 F.broadcast()，让 Spark 自己决定；或者真要 broadcast，先 .filter()/.select() 把表压小
+```
+
+**坑 2：Spark 估错小表大小，没自动 broadcast**
+
+```
+原因：表来自 cache 或带 filter 的 view，Spark 估算的 size 比实际大得多
+现象：Spark UI 显示 SortMergeJoin，但表其实只有 5MB
+修法：显式 F.broadcast(small_df) 兜底
+```
+
+**坑 3：broadcast 后表更新了，但 broadcast 缓存还是旧的**
+
+```
+原因：broadcast 变量在 Spark session 里有缓存，但你 union 了新数据进 small_df 后没重 broadcast
+现象：join 结果少匹配几行
+修法：每次 small_df 变了重新 F.broadcast() 一次（broadcast 不是 in-place 修改）
+```
+
+### Sort-Merge Join 还有一类特殊情况：skew
+
+两张大表 SMJ 时，如果 join key 分布严重不均（比如 80% 数据都是同一个 `product_id`），那 shuffle 后会出现**单个 partition 巨大、其他 partition 空闲**——一个 task 跑 30 分钟，其他 task 1 秒结束。这就是 [§3.5](#35-数据-skew-怎么定位) 里讲的 skew。
+
+**修法**：
+- **AQE (Adaptive Query Execution)**：Spark 3.0+ 自带，自动把大 partition 拆小。本项目 Glue 4.0 = Spark 3.3，默认开
+- **Salting**：手动给 hot key 加随机后缀，把一个 key 变成 N 个，分摊到 N 个 partition
+- **Broadcast 拯救**：如果一侧足够小，强行 broadcast 就绕开了 shuffle，skew 也就不存在了
+
+### 一句话总结
+
+> **一张小一张大用 Broadcast，两张都大用 Sort-Merge**。
+>
+> Spark UI 的 SQL tab 显示用了哪个——发现"明明应该是 BroadcastHashJoin 却显示 SortMergeJoin"，
+> 是性能调优最值钱的入口点之一。
+
+---
+
 ## 总结：这五个机制互相怎么配合
 
 ```
